@@ -4,6 +4,7 @@ import os
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -19,6 +20,9 @@ CONFIG_PATH = BASE_DIR / "config.json"
 POLL_TIMEOUT = 30
 SCHEDULER_INTERVAL = 20
 REPEAT_MINUTES = 10
+STATE_ADD_TIME = "add_time"
+STATE_ADD_TEXT = "add_text"
+STATE_COMMANDS = {"/start", "/help", "/list", "/off", "/delete", "/cancel"}
 
 
 @dataclass
@@ -62,12 +66,20 @@ class ReminderStore:
         conn.row_factory = sqlite3.Row
         return conn
 
+    @contextmanager
+    def _managed_connection(self) -> sqlite3.Connection:
+        conn = self._connect()
+        try:
+            yield conn
+        finally:
+            conn.close()
+
     def _column_exists(self, conn: sqlite3.Connection, column_name: str) -> bool:
         columns = conn.execute("PRAGMA table_info(reminders)").fetchall()
         return any(column["name"] == column_name for column in columns)
 
     def _init_db(self) -> None:
-        with self._connect() as conn:
+        with self._managed_connection() as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS reminders (
@@ -81,13 +93,23 @@ class ReminderStore:
                 """
             )
 
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_states (
+                    chat_id INTEGER PRIMARY KEY,
+                    state TEXT NOT NULL,
+                    payload TEXT
+                )
+                """
+            )
+
             if not self._column_exists(conn, "last_sent_at"):
                 conn.execute("ALTER TABLE reminders ADD COLUMN last_sent_at TEXT")
 
             conn.commit()
 
     def add_reminder(self, chat_id: int, time_text: str, message: str) -> int:
-        with self._connect() as conn:
+        with self._managed_connection() as conn:
             cursor = conn.execute(
                 """
                 INSERT INTO reminders (chat_id, time_text, message)
@@ -99,7 +121,7 @@ class ReminderStore:
             return int(cursor.lastrowid)
 
     def list_reminders(self, chat_id: int) -> list[sqlite3.Row]:
-        with self._connect() as conn:
+        with self._managed_connection() as conn:
             cursor = conn.execute(
                 """
                 SELECT id, time_text, message, active
@@ -112,7 +134,7 @@ class ReminderStore:
             return cursor.fetchall()
 
     def list_active_reminders(self) -> list[sqlite3.Row]:
-        with self._connect() as conn:
+        with self._managed_connection() as conn:
             cursor = conn.execute(
                 """
                 SELECT id, chat_id, time_text, message, active, last_sent_at
@@ -124,7 +146,7 @@ class ReminderStore:
             return cursor.fetchall()
 
     def disable_reminder(self, chat_id: int, reminder_id: int) -> bool:
-        with self._connect() as conn:
+        with self._managed_connection() as conn:
             cursor = conn.execute(
                 """
                 UPDATE reminders
@@ -137,7 +159,7 @@ class ReminderStore:
             return cursor.rowcount > 0
 
     def delete_reminder(self, chat_id: int, reminder_id: int) -> bool:
-        with self._connect() as conn:
+        with self._managed_connection() as conn:
             cursor = conn.execute(
                 "DELETE FROM reminders WHERE chat_id = ? AND id = ?",
                 (chat_id, reminder_id),
@@ -146,11 +168,39 @@ class ReminderStore:
             return cursor.rowcount > 0
 
     def mark_sent(self, reminder_id: int, slot_key: str) -> None:
-        with self._connect() as conn:
+        with self._managed_connection() as conn:
             conn.execute(
                 "UPDATE reminders SET last_sent_at = ? WHERE id = ?",
                 (slot_key, reminder_id),
             )
+            conn.commit()
+
+    def set_state(self, chat_id: int, state: str, payload: dict[str, Any] | None = None) -> None:
+        payload_text = json.dumps(payload or {}, ensure_ascii=False)
+        with self._managed_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO user_states (chat_id, state, payload)
+                VALUES (?, ?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET state = excluded.state, payload = excluded.payload
+                """,
+                (chat_id, state, payload_text),
+            )
+            conn.commit()
+
+    def get_state(self, chat_id: int) -> tuple[str, dict[str, Any]] | None:
+        with self._managed_connection() as conn:
+            row = conn.execute(
+                "SELECT state, payload FROM user_states WHERE chat_id = ?",
+                (chat_id,),
+            ).fetchone()
+            if not row:
+                return None
+            return str(row["state"]), json.loads(row["payload"] or "{}")
+
+    def clear_state(self, chat_id: int) -> None:
+        with self._managed_connection() as conn:
+            conn.execute("DELETE FROM user_states WHERE chat_id = ?", (chat_id,))
             conn.commit()
 
 
@@ -213,6 +263,25 @@ class TelegramBot:
                 "chat_id": chat_id,
                 "text": text,
                 "reply_markup": self._default_reply_markup(),
+            },
+        )
+
+    def send_inline_message(self, chat_id: int, text: str, inline_markup: str) -> None:
+        self._request(
+            "sendMessage",
+            {
+                "chat_id": chat_id,
+                "text": text,
+                "reply_markup": inline_markup,
+            },
+        )
+
+    def answer_callback_query(self, callback_query_id: str, text: str) -> None:
+        self._request(
+            "answerCallbackQuery",
+            {
+                "callback_query_id": callback_query_id,
+                "text": text,
             },
         )
 
@@ -295,6 +364,22 @@ def build_delete_help(rows: list[sqlite3.Row]) -> str:
     )
 
 
+def build_inline_disable_markup(reminder_id: int) -> str:
+    return json.dumps(
+        {
+            "inline_keyboard": [
+                [
+                    {
+                        "text": f"Выключить напоминание #{reminder_id}",
+                        "callback_data": f"off:{reminder_id}",
+                    }
+                ]
+            ]
+        },
+        ensure_ascii=False,
+    )
+
+
 def parse_command(text: str) -> tuple[str, str]:
     if not text:
         return "", ""
@@ -338,6 +423,53 @@ def is_due_reminder(reminder: sqlite3.Row, now: datetime) -> tuple[bool, str]:
     return True, slot_key
 
 
+def handle_add_flow(bot: TelegramBot, store: ReminderStore, chat_id: int, text: str) -> bool:
+    state_info = store.get_state(chat_id)
+    if not state_info:
+        return False
+
+    state, payload = state_info
+    if state == STATE_ADD_TIME:
+        time_text = validate_time(text.strip())
+        if not time_text:
+            bot.send_message(chat_id, "Введи время в формате HH:MM, например 09:00.")
+            return True
+
+        store.set_state(chat_id, STATE_ADD_TEXT, {"time_text": time_text})
+        bot.send_message(chat_id, "Теперь отправь комментарий к напоминанию.")
+        return True
+
+    if state == STATE_ADD_TEXT:
+        reminder_text = text.strip()
+        if not reminder_text:
+            bot.send_message(chat_id, "Комментарий не должен быть пустым. Напиши текст напоминания.")
+            return True
+
+        time_text = str(payload.get("time_text", "")).strip()
+        if not validate_time(time_text):
+            store.clear_state(chat_id)
+            bot.send_message(chat_id, "Состояние сбилось. Нажми «Добавить напоминание» ещё раз.")
+            return True
+
+        reminder_id = store.add_reminder(chat_id, time_text, reminder_text)
+        store.clear_state(chat_id)
+        bot.send_message(
+            chat_id,
+            f"Готово. Напоминание #{reminder_id} стартует в {time_text} и потом "
+            f"будет повторяться каждые {REPEAT_MINUTES} минут, пока ты его не выключишь.",
+        )
+        return True
+
+    return False
+
+
+def has_active_add_flow(store: ReminderStore, chat_id: int) -> bool:
+    state_info = store.get_state(chat_id)
+    if not state_info:
+        return False
+    return state_info[0] in {STATE_ADD_TIME, STATE_ADD_TEXT}
+
+
 def handle_message(
     bot: TelegramBot,
     store: ReminderStore,
@@ -346,11 +478,25 @@ def handle_message(
 ) -> None:
     chat = message.get("chat") or {}
     chat_id = chat.get("id")
-    text = message.get("text", "")
+    text = str(message.get("text", "")).strip()
     if not chat_id or not text:
         return
 
+    chat_id = int(chat_id)
+
     command, args = parse_command(text)
+
+    if command == "/cancel":
+        if has_active_add_flow(store, chat_id):
+            store.clear_state(chat_id)
+            bot.send_message(chat_id, "Добавление напоминания отменено.")
+        else:
+            bot.send_message(chat_id, "Сейчас нечего отменять.")
+        return
+
+    if has_active_add_flow(store, chat_id) and command not in STATE_COMMANDS:
+        if handle_add_flow(bot, store, chat_id, text):
+            return
 
     if command in {"/start", "/help"}:
         now = datetime.now(timezone).strftime("%H:%M")
@@ -361,6 +507,35 @@ def handle_message(
         return
 
     if command == "/add":
+        if args.strip():
+            parts = args.split(maxsplit=1)
+            if len(parts) < 2:
+                bot.send_message(chat_id, "После времени нужно написать текст напоминания.")
+                return
+
+            time_text = validate_time(parts[0])
+            if not time_text:
+                bot.send_message(chat_id, "Время нужно указать в формате HH:MM, например 09:00.")
+                return
+
+            reminder_text = parts[1].strip()
+            if not reminder_text:
+                bot.send_message(chat_id, "После времени нужно написать текст напоминания.")
+                return
+
+            reminder_id = store.add_reminder(chat_id, time_text, reminder_text)
+            bot.send_message(
+                chat_id,
+                f"Готово. Напоминание #{reminder_id} стартует в {time_text} и потом "
+                f"будет повторяться каждые {REPEAT_MINUTES} минут, пока ты его не выключишь.",
+            )
+            return
+
+        store.set_state(chat_id, STATE_ADD_TIME, {})
+        bot.send_message(chat_id, "Введи время напоминания в формате HH:MM.")
+        return
+
+    if command == "/add_legacy":
         parts = args.split(maxsplit=1)
         if len(parts) < 2:
             bot.send_message(chat_id, build_add_help())
@@ -431,25 +606,60 @@ def handle_message(
     bot.send_message(chat_id, "Не понял команду.\n\n" + build_help())
 
 
+def handle_callback_query(bot: TelegramBot, store: ReminderStore, callback_query: dict[str, Any]) -> None:
+    callback_query_id = str(callback_query.get("id", ""))
+    payload = str(callback_query.get("data", ""))
+    message = callback_query.get("message") or {}
+    chat = message.get("chat") or {}
+    chat_id = chat.get("id")
+
+    if not callback_query_id or not chat_id:
+        return
+
+    chat_id = int(chat_id)
+
+    if not payload.startswith("off:"):
+        bot.answer_callback_query(callback_query_id, "Неизвестное действие.")
+        return
+
+    reminder_id = payload.split(":", 1)[1].strip()
+    if not reminder_id.isdigit():
+        bot.answer_callback_query(callback_query_id, "Некорректный ID.")
+        return
+
+    disabled = store.disable_reminder(chat_id, int(reminder_id))
+    if disabled:
+        bot.answer_callback_query(callback_query_id, f"Напоминание #{reminder_id} выключено.")
+        bot.send_message(
+            chat_id,
+            f"Напоминание #{reminder_id} выключено.\n\n" + format_reminders(store.list_reminders(chat_id)),
+        )
+    else:
+        bot.answer_callback_query(callback_query_id, "Это напоминание уже выключено или не найдено.")
+
+
 def scheduler_loop(bot: TelegramBot, store: ReminderStore, timezone: ZoneInfo) -> None:
     while True:
-        now = datetime.now(timezone)
-
         try:
+            now = datetime.now(timezone)
             reminders = store.list_active_reminders()
             for reminder in reminders:
-                due, slot_key = is_due_reminder(reminder, now)
-                if not due:
-                    continue
+                try:
+                    due, slot_key = is_due_reminder(reminder, now)
+                    if not due:
+                        continue
 
-                bot.send_message(
-                    int(reminder["chat_id"]),
-                    "Пора выпить таблетки.\n\n"
-                    f"{reminder['message']}\n\n"
-                    f"Это напоминание будет повторяться каждые {REPEAT_MINUTES} минут, "
-                    "пока ты его не выключишь.",
-                )
-                store.mark_sent(int(reminder["id"]), slot_key)
+                    bot.send_inline_message(
+                        int(reminder["chat_id"]),
+                        "Пора выпить таблетки.\n\n"
+                        f"{reminder['message']}\n\n"
+                        f"Это напоминание будет повторяться каждые {REPEAT_MINUTES} минут, "
+                        "пока ты его не выключишь.",
+                        build_inline_disable_markup(int(reminder["id"])),
+                    )
+                    store.mark_sent(int(reminder["id"]), slot_key)
+                except Exception:
+                    logging.exception("Failed to process reminder %s", reminder["id"])
         except Exception:
             logging.exception("Scheduler error")
 
@@ -483,8 +693,11 @@ def main() -> None:
             for update in updates:
                 offset = int(update["update_id"]) + 1
                 message = update.get("message")
+                callback_query = update.get("callback_query")
                 if message:
                     handle_message(bot, store, timezone, message)
+                if callback_query:
+                    handle_callback_query(bot, store, callback_query)
         except KeyboardInterrupt:
             logging.info("Bot stopped by user")
             break
