@@ -1,10 +1,8 @@
 import json
 import logging
 import os
-import sqlite3
 import time
 import uuid
-from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -99,81 +97,65 @@ def load_config() -> Config:
 class Store:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
-        self._init_db()
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.db_path.exists():
+            self._write({"last_id": 0, "requests": []})
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
+    def _read(self) -> dict[str, Any]:
+        if not self.db_path.exists():
+            return {"last_id": 0, "requests": []}
+        with self.db_path.open("r", encoding="utf-8") as fh:
+            return json.load(fh)
 
-    @contextmanager
-    def _managed_connection(self) -> sqlite3.Connection:
-        conn = self._connect()
-        try:
-            yield conn
-        finally:
-            conn.close()
-
-    def _init_db(self) -> None:
-        with self._managed_connection() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS vpn_requests (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    chat_id INTEGER NOT NULL,
-                    username TEXT NOT NULL DEFAULT '',
-                    full_name TEXT NOT NULL DEFAULT '',
-                    status TEXT NOT NULL DEFAULT 'pending',
-                    profile_type TEXT NOT NULL DEFAULT '',
-                    client_email TEXT NOT NULL DEFAULT '',
-                    uuid TEXT NOT NULL DEFAULT '',
-                    created_at TEXT NOT NULL,
-                    decided_at TEXT
-                )
-                """
-            )
-            conn.commit()
+    def _write(self, data: dict[str, Any]) -> None:
+        with self.db_path.open("w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
 
     def create_request(self, chat_id: int, username: str, full_name: str) -> int:
         now = datetime.utcnow().isoformat(timespec="seconds")
-        with self._managed_connection() as conn:
-            existing = conn.execute(
-                """
-                SELECT id FROM vpn_requests
-                WHERE chat_id = ? AND status = 'pending'
-                ORDER BY id DESC LIMIT 1
-                """,
-                (chat_id,),
-            ).fetchone()
-            if existing:
-                return int(existing["id"])
+        data = self._read()
+        for request in reversed(data["requests"]):
+            if int(request["chat_id"]) == chat_id and request["status"] == "pending":
+                return int(request["id"])
 
-            cursor = conn.execute(
-                """
-                INSERT INTO vpn_requests (chat_id, username, full_name, created_at)
-                VALUES (?, ?, ?, ?)
-                """,
-                (chat_id, username, full_name, now),
-            )
-            conn.commit()
-            return int(cursor.lastrowid)
+        request_id = int(data.get("last_id", 0)) + 1
+        data["last_id"] = request_id
+        data["requests"].append(
+            {
+                "id": request_id,
+                "chat_id": chat_id,
+                "username": username,
+                "full_name": full_name,
+                "status": "pending",
+                "profile_type": "",
+                "client_email": "",
+                "uuid": "",
+                "created_at": now,
+                "decided_at": None,
+            }
+        )
+        self._write(data)
+        return request_id
 
-    def get_request(self, request_id: int) -> sqlite3.Row | None:
-        with self._managed_connection() as conn:
-            return conn.execute("SELECT * FROM vpn_requests WHERE id = ?", (request_id,)).fetchone()
+    def get_request(self, request_id: int) -> dict[str, Any] | None:
+        data = self._read()
+        for request in data["requests"]:
+            if int(request["id"]) == request_id:
+                return request
+        return None
 
     def finish_request(self, request_id: int, status: str, profile_type: str, client_email: str, client_uuid: str) -> None:
         now = datetime.utcnow().isoformat(timespec="seconds")
-        with self._managed_connection() as conn:
-            conn.execute(
-                """
-                UPDATE vpn_requests
-                SET status = ?, profile_type = ?, client_email = ?, uuid = ?, decided_at = ?
-                WHERE id = ?
-                """,
-                (status, profile_type, client_email, client_uuid, now, request_id),
-            )
-            conn.commit()
+        data = self._read()
+        for request in data["requests"]:
+            if int(request["id"]) == request_id:
+                request["status"] = status
+                request["profile_type"] = profile_type
+                request["client_email"] = client_email
+                request["uuid"] = client_uuid
+                request["decided_at"] = now
+                self._write(data)
+                return
 
 
 class TelegramBot:

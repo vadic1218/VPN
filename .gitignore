@@ -7,3 +7,5 @@ v2ray_reality_telegram/*generated.json
 v2ray_reality_telegram/*.bak.*
 vpn_approval_bot/config.json
 vpn_approval_bot/*.db
+vpn_approval_bot/*.json
+vpn_approval.json
