@@ -330,9 +330,48 @@ class XrayManager:
             if rc != 0:
                 self._restore_backup(backup_path)
                 raise RuntimeError(f"Xray is not active after update; rolled back: {out}{err}")
+
+            self.reset_profile_guard_binding(client_email)
         finally:
             if sftp is not None:
                 sftp.close()
+            client.close()
+
+    def reset_profile_guard_binding(self, client_email: str) -> None:
+        client = self._connect()
+        try:
+            email_literal = json.dumps(client_email)
+            command = f"""
+python3 - <<'PY'
+import json
+from pathlib import Path
+
+email = {email_literal}
+state_path = Path('/var/lib/xray-profile-guard/state.json')
+if state_path.exists():
+    state = json.loads(state_path.read_text(encoding='utf-8'))
+else:
+    state = {{}}
+state.setdefault('bindings', {{}}).pop(email, None)
+state['blocked_attempts'] = [
+    item for item in state.get('blocked_attempts', [])
+    if item.get('email') != email
+]
+prefix = f'{{email}}|'
+state['last_attempt_keys'] = {{
+    key: value for key, value in state.get('last_attempt_keys', {{}}).items()
+    if not key.startswith(prefix)
+}}
+state_path.parent.mkdir(parents=True, exist_ok=True)
+state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + '\\n', encoding='utf-8')
+state_path.chmod(0o600)
+PY
+systemctl restart xray-profile-guard
+"""
+            rc, out, err = self._run(client, command)
+            if rc != 0:
+                raise RuntimeError(f"Profile guard reset failed: {out}{err}")
+        finally:
             client.close()
 
     def get_last_seen_by_email(self, emails: list[str]) -> dict[str, str]:
