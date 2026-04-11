@@ -146,13 +146,20 @@ class Store:
                 return request
         return None
 
+    def get_active_request_by_chat_id(self, chat_id: int) -> dict[str, Any] | None:
+        data = self._read()
+        for request in reversed(data["requests"]):
+            if int(request["chat_id"]) == chat_id and request.get("status") in {"pending", "approved"}:
+                return request
+        return None
+
     def list_approved_requests(self) -> list[dict[str, Any]]:
         data = self._read()
-        requests = [
-            request for request in data["requests"]
-            if request.get("status") == "approved" and request.get("client_email")
-        ]
-        return sorted(requests, key=lambda item: int(item["id"]))
+        latest_by_chat_id: dict[int, dict[str, Any]] = {}
+        for request in data["requests"]:
+            if request.get("status") == "approved" and request.get("client_email"):
+                latest_by_chat_id[int(request["chat_id"])] = request
+        return sorted(latest_by_chat_id.values(), key=lambda item: int(item["id"]))
 
     def finish_request(self, request_id: int, status: str, profile_type: str, client_email: str, client_uuid: str) -> None:
         now = datetime.utcnow().isoformat(timespec="seconds")
@@ -160,6 +167,19 @@ class Store:
         for request in data["requests"]:
             if int(request["id"]) == request_id:
                 request["status"] = status
+                request["profile_type"] = profile_type
+                request["client_email"] = client_email
+                request["uuid"] = client_uuid
+                request["decided_at"] = now
+                self._write(data)
+                return
+
+    def update_profile(self, request_id: int, profile_type: str, client_email: str, client_uuid: str) -> None:
+        now = datetime.utcnow().isoformat(timespec="seconds")
+        data = self._read()
+        for request in data["requests"]:
+            if int(request["id"]) == request_id:
+                request["status"] = "approved"
                 request["profile_type"] = profile_type
                 request["client_email"] = client_email
                 request["uuid"] = client_uuid
@@ -256,7 +276,7 @@ class XrayManager:
         finally:
             client.close()
 
-    def add_client(self, client_email: str, client_uuid: str) -> None:
+    def save_client(self, client_email: str, client_uuid: str) -> None:
         client = self._connect()
         sftp = client.open_sftp()
         stamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
@@ -281,9 +301,8 @@ class XrayManager:
                 if inbound.get("protocol") != "vless":
                     continue
                 clients = inbound.setdefault("settings", {}).setdefault("clients", [])
-                emails = {item.get("email") for item in clients}
-                if client_email not in emails:
-                    clients.append(dict(new_client))
+                clients[:] = [item for item in clients if item.get("email") != client_email]
+                clients.append(dict(new_client))
 
             candidate = "/tmp/xray-config-vpn-bot.json"
             with sftp.open(candidate, "w") as fh:
@@ -389,6 +408,20 @@ def admin_request_markup(request_id: int) -> str:
     )
 
 
+def admin_client_markup(request_id: int) -> str:
+    return json.dumps(
+        {
+            "inline_keyboard": [
+                [
+                    {"text": "Перевыпустить 443", "callback_data": f"reissue:default:{request_id}"},
+                    {"text": "Перевыпустить МТС", "callback_data": f"reissue:mts:{request_id}"},
+                ]
+            ]
+        },
+        ensure_ascii=False,
+    )
+
+
 def parse_iso_time(value: str) -> datetime | None:
     if not value:
         return None
@@ -435,6 +468,19 @@ def format_client_list(rows: list[dict[str, Any]], last_seen: dict[str, str]) ->
     return "\n".join(lines)
 
 
+def format_client_card(row: dict[str, Any], last_seen: dict[str, str]) -> str:
+    profile_type = "МТС 8443" if row.get("profile_type") == "mts" else "Обычный 443"
+    email = str(row.get("client_email") or "")
+    username = str(row.get("username") or "-")
+    return (
+        f"Клиент #{row['id']}\n"
+        f"Username: @{username}\n"
+        f"Тип: {profile_type}\n"
+        f"Создан: {format_age(str(row.get('decided_at') or row.get('created_at') or ''))}\n"
+        f"Активность: {format_age(last_seen.get(email))}"
+    )
+
+
 def user_display(user: dict[str, Any]) -> tuple[str, str]:
     username = str(user.get("username") or "").strip()
     first_name = str(user.get("first_name") or "").strip()
@@ -479,6 +525,8 @@ def handle_message(bot: TelegramBot, store: Store, config: Config, manager: Xray
             bot.send_message(chat_id, f"Не смог получить активность с сервера: {error_text}", admin_reply_markup())
             return
         bot.send_message(chat_id, format_client_list(rows, last_seen), admin_reply_markup())
+        for row in rows:
+            bot.send_message(chat_id, format_client_card(row, last_seen), admin_client_markup(int(row["id"])))
         return
 
     if text.startswith("/vpn_status"):
@@ -494,6 +542,24 @@ def handle_message(bot: TelegramBot, store: Store, config: Config, manager: Xray
         return
 
     if text.startswith("/vpn"):
+        existing = store.get_active_request_by_chat_id(chat_id)
+        if existing:
+            if existing.get("status") == "pending":
+                bot.send_message(
+                    chat_id,
+                    f"У тебя уже есть заявка #{existing['id']} на рассмотрении. Дождись решения админа.",
+                )
+                return
+            if existing.get("status") == "approved":
+                profile_type = str(existing.get("profile_type") or "default")
+                label = f"VPN {existing['id']} {'MTS' if profile_type == 'mts' else '443'}"
+                link = build_vless_link(config, str(existing["uuid"]), profile_type, label)
+                bot.send_message(
+                    chat_id,
+                    "У тебя уже есть активный VPN-профиль. Новую заявку создавать нельзя.\n\n"
+                    "Твоя ссылка:\n\n" + link,
+                )
+                return
         bot.send_message(
             chat_id,
             "Выбери своего оператора. Если VPN часто пропадает на МТС, выбирай МТС.",
@@ -541,6 +607,35 @@ def handle_callback(bot: TelegramBot, store: Store, config: Config, manager: Xra
         bot.answer_callback_query(callback_id, "Нет доступа.")
         return
 
+    if parts[0] == "reissue" and len(parts) == 3 and parts[2].isdigit():
+        profile_type = parts[1]
+        request_id = int(parts[2])
+        if profile_type not in {"default", "mts"}:
+            bot.answer_callback_query(callback_id, "Unknown profile type.")
+            return
+        row = store.get_request(request_id)
+        if not row or row["status"] != "approved":
+            bot.answer_callback_query(callback_id, "Active profile not found.")
+            return
+
+        client_uuid = str(uuid.uuid4())
+        client_email = str(row.get("client_email") or f"tg-{row['chat_id']}-{request_id}")
+        try:
+            manager.save_client(client_email, client_uuid)
+        except Exception as exc:
+            logging.exception("Failed to reissue VPN profile")
+            bot.answer_callback_query(callback_id, "Error, config was not changed or was rolled back.")
+            bot.send_message(user_chat_id, f"Could not reissue profile #{request_id}: {exc}")
+            return
+
+        store.update_profile(request_id, profile_type, client_email, client_uuid)
+        label = f"VPN {request_id} {'MTS' if profile_type == 'mts' else '443'}"
+        link = build_vless_link(config, client_uuid, profile_type, label)
+        bot.answer_callback_query(callback_id, "Link reissued.")
+        bot.send_message(int(row["chat_id"]), "Your VPN link was reissued. The old link no longer works:\n\n" + link)
+        bot.send_message(user_chat_id, f"Profile #{request_id} reissued as {profile_type}.")
+        return
+
     if parts[0] == "reject" and len(parts) == 2 and parts[1].isdigit():
         request_id = int(parts[1])
         row = store.get_request(request_id)
@@ -565,7 +660,7 @@ def handle_callback(bot: TelegramBot, store: Store, config: Config, manager: Xra
         client_uuid = str(uuid.uuid4())
         client_email = f"tg-{row['chat_id']}-{request_id}"
         try:
-            manager.add_client(client_email, client_uuid)
+            manager.save_client(client_email, client_uuid)
         except Exception as exc:
             logging.exception("Failed to create VPN profile")
             bot.answer_callback_query(callback_id, "Ошибка, конфиг не изменён или откатан.")
