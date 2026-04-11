@@ -3,3 +3,7 @@ __pycache__/
 reminders.db
 config.json
 .env
+v2ray_reality_telegram/*generated.json
+v2ray_reality_telegram/*.bak.*
+vpn_approval_bot/config.json
+vpn_approval_bot/*.db
