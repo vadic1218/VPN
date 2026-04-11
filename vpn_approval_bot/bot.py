@@ -278,6 +278,12 @@ class TelegramBot:
     def answer_callback_query(self, callback_query_id: str, text: str) -> None:
         self._request("answerCallbackQuery", {"callback_query_id": callback_query_id, "text": text})
 
+    def safe_answer_callback_query(self, callback_query_id: str, text: str) -> None:
+        try:
+            self.answer_callback_query(callback_query_id, text)
+        except Exception:
+            logging.warning("Could not answer callback query", exc_info=True)
+
 
 class XrayManager:
     def __init__(self, config: Config) -> None:
@@ -416,7 +422,9 @@ state_path.parent.mkdir(parents=True, exist_ok=True)
 state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + '\\n', encoding='utf-8')
 state_path.chmod(0o600)
 PY
-systemctl restart xray-profile-guard
+if systemctl is-active --quiet xray-profile-guard; then
+    systemctl restart xray-profile-guard
+fi
 """
             rc, out, err = self._run(client, command)
             if rc != 0:
@@ -803,18 +811,18 @@ def handle_callback(bot: TelegramBot, store: Store, config: Config, manager: Xra
 
         client_uuid = str(uuid.uuid4())
         client_email = str(row.get("client_email") or f"tg-{row['chat_id']}-{request_id}")
+        bot.safe_answer_callback_query(callback_id, "Перевыпускаю ссылку...")
         try:
             manager.save_client(client_email, client_uuid)
         except Exception as exc:
             logging.exception("Failed to reissue VPN profile")
-            bot.answer_callback_query(callback_id, "Ошибка, конфиг не изменён или откатан.")
+            bot.safe_answer_callback_query(callback_id, "Ошибка, конфиг не изменён или откатан.")
             bot.send_message(user_chat_id, f"Не смог перевыпустить профиль #{request_id}: {exc}")
             return
 
         store.update_profile(request_id, profile_type, client_email, client_uuid)
         label = f"VPN {request_id} {profile_short(profile_type)}"
         link = build_vless_link(config, client_uuid, profile_type, label)
-        bot.answer_callback_query(callback_id, "Ссылка перевыпущена.")
         bot.send_message(int(row["chat_id"]), "Твоя VPN-ссылка перевыпущена. Старая ссылка больше не работает:\n\n" + link)
         bot.send_message(user_chat_id, f"Профиль #{request_id} перевыпущен как {profile_label(profile_type)}.")
         return
@@ -842,18 +850,18 @@ def handle_callback(bot: TelegramBot, store: Store, config: Config, manager: Xra
 
         client_uuid = str(uuid.uuid4())
         client_email = f"tg-{row['chat_id']}-{request_id}"
+        bot.safe_answer_callback_query(callback_id, "Создаю профиль...")
         try:
             manager.save_client(client_email, client_uuid)
         except Exception as exc:
             logging.exception("Failed to create VPN profile")
-            bot.answer_callback_query(callback_id, "Ошибка, конфиг не изменён или откатан.")
+            bot.safe_answer_callback_query(callback_id, "Ошибка, конфиг не изменён или откатан.")
             bot.send_message(user_chat_id, f"Не смог создать профиль для заявки #{request_id}: {exc}")
             return
 
         store.finish_request(request_id, "approved", profile_type, client_email, client_uuid)
         label = f"VPN {request_id} {profile_short(profile_type)}"
         link = build_vless_link(config, client_uuid, profile_type, label)
-        bot.answer_callback_query(callback_id, "Профиль создан.")
         bot.send_message(int(row["chat_id"]), "Заявка одобрена. Твоя VPN-ссылка:\n\n" + link)
         bot.send_message(user_chat_id, f"Готово. Заявка #{request_id} одобрена как {profile_label(profile_type)}.")
 
