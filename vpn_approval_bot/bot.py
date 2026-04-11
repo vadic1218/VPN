@@ -321,9 +321,17 @@ class XrayManager:
             return {}
         client = self._connect()
         try:
-            rc, out, err = self._run(client, 'journalctl -u xray --since "30 days ago" -o short-iso --no-pager')
+            command = (
+                'journalctl -u xray --since "30 days ago" -o short-iso --no-pager '
+                f"| grep -F -e 'email: {emails[0].replace(chr(39), chr(39) + chr(34) + chr(39) + chr(34) + chr(39))}'"
+            )
+            for email in emails[1:]:
+                escaped = email.replace("'", "'\"'\"'")
+                command += f" -e 'email: {escaped}'"
+            command += " | tail -n 1000 || true"
+            rc, out, err = self._run(client, command)
             if rc != 0:
-                raise RuntimeError(f"Could not read Xray journal: {out}{err}")
+                raise RuntimeError((err or "Could not read Xray journal").strip()[:500])
         finally:
             client.close()
 
@@ -472,7 +480,10 @@ def handle_message(bot: TelegramBot, store: Store, config: Config, manager: Xray
             last_seen = manager.get_last_seen_by_email([str(row["client_email"]) for row in rows])
         except Exception as exc:
             logging.exception("Failed to load client activity")
-            bot.send_message(chat_id, f"Не смог получить активность с сервера: {exc}", admin_reply_markup())
+            error_text = str(exc)
+            if len(error_text) > 500:
+                error_text = error_text[:500] + "..."
+            bot.send_message(chat_id, f"Не смог получить активность с сервера: {error_text}", admin_reply_markup())
             return
         bot.send_message(chat_id, format_client_list(rows, last_seen), admin_reply_markup())
         return
