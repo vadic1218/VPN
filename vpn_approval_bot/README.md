@@ -48,6 +48,17 @@ Admin commands:
 /clients
 ```
 
+User commands:
+
+```text
+/vpn
+/reissue
+/vpn_status ID
+```
+
+`/reissue` lets an approved user request a new link. The old UUID is replaced
+only after admin approval.
+
 ## Notes
 
 - Keep `VPN_SSH_PASSWORD` out of Git.
