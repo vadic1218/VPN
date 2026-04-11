@@ -550,7 +550,7 @@ def handle_message(bot: TelegramBot, store: Store, config: Config, manager: Xray
             "Команды:\n"
             "/vpn - выбрать оператора и отправить заявку на VPN\n"
             "/vpn_status ID - проверить заявку\n"
-            "/clients - список клиентов, только для админа",
+            "/reissue - перевыпуск ссылки",
             reply_markup,
         )
         return
