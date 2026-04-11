@@ -111,11 +111,13 @@ class Store:
         with self.db_path.open("w", encoding="utf-8") as fh:
             json.dump(data, fh, ensure_ascii=False, indent=2)
 
-    def create_request(self, chat_id: int, username: str, full_name: str) -> int:
+    def create_request(self, chat_id: int, username: str, full_name: str, profile_type: str) -> int:
         now = datetime.utcnow().isoformat(timespec="seconds")
         data = self._read()
         for request in reversed(data["requests"]):
             if int(request["chat_id"]) == chat_id and request["status"] == "pending":
+                request["profile_type"] = profile_type
+                self._write(data)
                 return int(request["id"])
 
         request_id = int(data.get("last_id", 0)) + 1
@@ -127,7 +129,7 @@ class Store:
                 "username": username,
                 "full_name": full_name,
                 "status": "pending",
-                "profile_type": "",
+                "profile_type": profile_type,
                 "client_email": "",
                 "uuid": "",
                 "created_at": now,
@@ -318,15 +320,28 @@ def build_vless_link(config: Config, client_uuid: str, profile_type: str, label:
     )
 
 
-def request_markup(request_id: int) -> str:
+def profile_choice_markup() -> str:
     return json.dumps(
         {
             "inline_keyboard": [
                 [
-                    {"text": "Обычный 443", "callback_data": f"approve:default:{request_id}"},
-                    {"text": "МТС 8443", "callback_data": f"approve:mts:{request_id}"},
-                ],
-                [{"text": "Отклонить", "callback_data": f"reject:{request_id}"}],
+                    {"text": "Обычный оператор", "callback_data": "request:default"},
+                    {"text": "МТС", "callback_data": "request:mts"},
+                ]
+            ]
+        },
+        ensure_ascii=False,
+    )
+
+
+def admin_request_markup(request_id: int) -> str:
+    return json.dumps(
+        {
+            "inline_keyboard": [
+                [
+                    {"text": "Одобрить", "callback_data": f"approve:{request_id}"},
+                    {"text": "Отклонить", "callback_data": f"reject:{request_id}"},
+                ]
             ]
         },
         ensure_ascii=False,
@@ -354,7 +369,7 @@ def handle_message(bot: TelegramBot, store: Store, config: Config, message: dict
             chat_id,
             "Привет. Этот бот выдаёт VPN после одобрения админом.\n\n"
             "Команды:\n"
-            "/vpn - отправить заявку на VPN\n"
+            "/vpn - выбрать оператора и отправить заявку на VPN\n"
             "/vpn_status ID - проверить заявку",
         )
         return
@@ -372,17 +387,11 @@ def handle_message(bot: TelegramBot, store: Store, config: Config, message: dict
         return
 
     if text.startswith("/vpn"):
-        username, full_name = user_display(user)
-        request_id = store.create_request(chat_id, username, full_name)
-        bot.send_message(chat_id, f"Заявка #{request_id} отправлена админу. Дождись одобрения.")
-        admin_text = (
-            f"Новая VPN-заявка #{request_id}\n"
-            f"Chat ID: {chat_id}\n"
-            f"Username: @{username}" if username else f"Новая VPN-заявка #{request_id}\nChat ID: {chat_id}\nUsername: -"
+        bot.send_message(
+            chat_id,
+            "Выбери своего оператора. Если VPN часто пропадает на МТС, выбирай МТС.",
+            profile_choice_markup(),
         )
-        admin_text += f"\nName: {full_name or '-'}"
-        for admin_chat_id in config.admin_chat_ids:
-            bot.send_message(admin_chat_id, admin_text, request_markup(request_id))
         return
 
     bot.send_message(chat_id, "Напиши /vpn, чтобы запросить VPN-доступ.")
@@ -391,15 +400,38 @@ def handle_message(bot: TelegramBot, store: Store, config: Config, message: dict
 def handle_callback(bot: TelegramBot, store: Store, config: Config, manager: XrayManager, callback_query: dict[str, Any]) -> None:
     callback_id = str(callback_query.get("id") or "")
     from_user = callback_query.get("from") or {}
-    admin_chat_id = int(from_user.get("id") or 0)
+    user_chat_id = int(from_user.get("id") or 0)
     payload = str(callback_query.get("data") or "")
-
-    if admin_chat_id not in config.admin_chat_ids:
-        bot.answer_callback_query(callback_id, "Нет доступа.")
-        return
 
     parts = payload.split(":")
     if not parts:
+        return
+
+    if parts[0] == "request" and len(parts) == 2:
+        profile_type = parts[1]
+        if profile_type not in {"default", "mts"}:
+            bot.answer_callback_query(callback_id, "Неизвестный тип профиля.")
+            return
+
+        username, full_name = user_display(from_user)
+        request_id = store.create_request(user_chat_id, username, full_name, profile_type)
+        profile_label = "МТС 8443" if profile_type == "mts" else "Обычный 443"
+        bot.answer_callback_query(callback_id, "Заявка отправлена.")
+        bot.send_message(user_chat_id, f"Заявка #{request_id} отправлена админу. Тип: {profile_label}.")
+
+        admin_text = (
+            f"Новая VPN-заявка #{request_id}\n"
+            f"Тип: {profile_label}\n"
+            f"Chat ID: {user_chat_id}\n"
+            f"Username: @{username if username else '-'}\n"
+            f"Name: {full_name or '-'}"
+        )
+        for admin_chat_id in config.admin_chat_ids:
+            bot.send_message(admin_chat_id, admin_text, admin_request_markup(request_id))
+        return
+
+    if user_chat_id not in config.admin_chat_ids:
+        bot.answer_callback_query(callback_id, "Нет доступа.")
         return
 
     if parts[0] == "reject" and len(parts) == 2 and parts[1].isdigit():
@@ -413,16 +445,15 @@ def handle_callback(bot: TelegramBot, store: Store, config: Config, manager: Xra
         bot.send_message(int(row["chat_id"]), f"Заявка #{request_id} отклонена.")
         return
 
-    if parts[0] == "approve" and len(parts) == 3 and parts[2].isdigit():
-        profile_type = parts[1]
-        request_id = int(parts[2])
-        if profile_type not in {"default", "mts"}:
-            bot.answer_callback_query(callback_id, "Неизвестный тип профиля.")
-            return
+    if parts[0] == "approve" and len(parts) == 2 and parts[1].isdigit():
+        request_id = int(parts[1])
         row = store.get_request(request_id)
         if not row or row["status"] != "pending":
             bot.answer_callback_query(callback_id, "Заявка уже обработана.")
             return
+        profile_type = str(row.get("profile_type") or "default")
+        if profile_type not in {"default", "mts"}:
+            profile_type = "default"
 
         client_uuid = str(uuid.uuid4())
         client_email = f"tg-{row['chat_id']}-{request_id}"
@@ -431,7 +462,7 @@ def handle_callback(bot: TelegramBot, store: Store, config: Config, manager: Xra
         except Exception as exc:
             logging.exception("Failed to create VPN profile")
             bot.answer_callback_query(callback_id, "Ошибка, конфиг не изменён или откатан.")
-            bot.send_message(admin_chat_id, f"Не смог создать профиль для заявки #{request_id}: {exc}")
+            bot.send_message(user_chat_id, f"Не смог создать профиль для заявки #{request_id}: {exc}")
             return
 
         store.finish_request(request_id, "approved", profile_type, client_email, client_uuid)
@@ -439,7 +470,7 @@ def handle_callback(bot: TelegramBot, store: Store, config: Config, manager: Xra
         link = build_vless_link(config, client_uuid, profile_type, label)
         bot.answer_callback_query(callback_id, "Профиль создан.")
         bot.send_message(int(row["chat_id"]), "Заявка одобрена. Твоя VPN-ссылка:\n\n" + link)
-        bot.send_message(admin_chat_id, f"Готово. Заявка #{request_id} одобрена как {profile_type}.")
+        bot.send_message(user_chat_id, f"Готово. Заявка #{request_id} одобрена как {profile_type}.")
 
 
 def main() -> None:
