@@ -321,14 +321,7 @@ class XrayManager:
             return {}
         client = self._connect()
         try:
-            command = (
-                'journalctl -u xray --since "30 days ago" -o short-iso --no-pager '
-                f"| grep -F -e 'email: {emails[0].replace(chr(39), chr(39) + chr(34) + chr(39) + chr(34) + chr(39))}'"
-            )
-            for email in emails[1:]:
-                escaped = email.replace("'", "'\"'\"'")
-                command += f" -e 'email: {escaped}'"
-            command += " | tail -n 1000 || true"
+            command = "journalctl -u xray -n 5000 -o short-iso --no-pager || true"
             rc, out, err = self._run(client, command)
             if rc != 0:
                 raise RuntimeError((err or "Could not read Xray journal").strip()[:500])
