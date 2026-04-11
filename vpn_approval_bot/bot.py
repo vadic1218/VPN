@@ -35,7 +35,56 @@ class Config:
     vpn_short_id: str
     default_port: int
     mts_port: int
+    alt_port: int
     backup_dir: str
+
+
+OPERATOR_PROFILES: dict[str, dict[str, str]] = {
+    "default": {"button": "Обычный оператор", "label": "Обычный 443", "short": "443", "port": "default"},
+    "mts": {"button": "МТС", "label": "МТС 8443", "short": "MTS", "port": "mts"},
+    "megafon": {"button": "МегаФон", "label": "МегаФон 8443", "short": "MegaFon", "port": "mts"},
+    "beeline": {"button": "Билайн", "label": "Билайн 443", "short": "Beeline", "port": "default"},
+    "tele2": {"button": "Tele2", "label": "Tele2 8443", "short": "Tele2", "port": "mts"},
+    "yota": {"button": "Yota", "label": "Yota 8443", "short": "Yota", "port": "mts"},
+    "rostelecom": {"button": "Ростелеком", "label": "Ростелеком 443", "short": "RTK", "port": "default"},
+    "tbank": {"button": "Т-Мобайл", "label": "Т-Мобайл 8443", "short": "T-Mobile", "port": "mts"},
+    "tmobile_us": {"button": "T-Mobile", "label": "T-Mobile 2053", "short": "T-Mobile", "port": "alt"},
+}
+
+
+def is_profile_type(profile_type: str) -> bool:
+    return profile_type in OPERATOR_PROFILES
+
+
+def profile_info(profile_type: str) -> dict[str, str]:
+    return OPERATOR_PROFILES.get(profile_type, OPERATOR_PROFILES["default"])
+
+
+def profile_label(profile_type: str) -> str:
+    return profile_info(profile_type)["label"]
+
+
+def profile_short(profile_type: str) -> str:
+    return profile_info(profile_type)["short"]
+
+
+def profile_port(config: Config, profile_type: str) -> int:
+    port_key = profile_info(profile_type)["port"]
+    if port_key == "mts":
+        return config.mts_port
+    if port_key == "alt":
+        return config.alt_port
+    return config.default_port
+
+
+def profile_button_rows(callback_prefix: str, request_id: int | None = None) -> list[list[dict[str, str]]]:
+    buttons: list[dict[str, str]] = []
+    for profile_type, info in OPERATOR_PROFILES.items():
+        callback_data = f"{callback_prefix}:{profile_type}"
+        if request_id is not None:
+            callback_data = f"{callback_data}:{request_id}"
+        buttons.append({"text": info["button"], "callback_data": callback_data})
+    return [buttons[index : index + 2] for index in range(0, len(buttons), 2)]
 
 
 def _get(raw: dict[str, Any], env_name: str, default: str = "") -> str:
@@ -90,6 +139,7 @@ def load_config() -> Config:
         vpn_short_id=vpn_short_id,
         default_port=int(_get(raw, "VPN_DEFAULT_PORT", "443")),
         mts_port=int(_get(raw, "VPN_MTS_PORT", "8443")),
+        alt_port=int(_get(raw, "VPN_ALT_PORT", "2053")),
         backup_dir=_get(raw, "VPN_BACKUP_DIR", "/usr/local/etc/xray"),
     )
 
@@ -398,7 +448,7 @@ systemctl restart xray-profile-guard
 
 
 def build_vless_link(config: Config, client_uuid: str, profile_type: str, label: str) -> str:
-    port = config.mts_port if profile_type == "mts" else config.default_port
+    port = profile_port(config, profile_type)
     fragment = quote(label)
     return (
         f"vless://{client_uuid}@{config.vpn_host}:{port}"
@@ -438,14 +488,7 @@ def user_reply_markup() -> str:
 
 def profile_choice_markup() -> str:
     return json.dumps(
-        {
-            "inline_keyboard": [
-                [
-                    {"text": "Обычный оператор", "callback_data": "request:default"},
-                    {"text": "МТС", "callback_data": "request:mts"},
-                ]
-            ]
-        },
+        {"inline_keyboard": profile_button_rows("request")},
         ensure_ascii=False,
     )
 
@@ -466,14 +509,7 @@ def admin_request_markup(request_id: int) -> str:
 
 def reissue_choice_markup(request_id: int) -> str:
     return json.dumps(
-        {
-            "inline_keyboard": [
-                [
-                    {"text": "Обычный 443", "callback_data": f"reissue_request:default:{request_id}"},
-                    {"text": "МТС 8443", "callback_data": f"reissue_request:mts:{request_id}"},
-                ]
-            ]
-        },
+        {"inline_keyboard": profile_button_rows("reissue_request", request_id)},
         ensure_ascii=False,
     )
 
@@ -494,14 +530,7 @@ def admin_reissue_request_markup(request_id: int, profile_type: str) -> str:
 
 def admin_client_markup(request_id: int) -> str:
     return json.dumps(
-        {
-            "inline_keyboard": [
-                [
-                    {"text": "Перевыпустить 443", "callback_data": f"reissue:default:{request_id}"},
-                    {"text": "Перевыпустить МТС", "callback_data": f"reissue:mts:{request_id}"},
-                ]
-            ]
-        },
+        {"inline_keyboard": profile_button_rows("reissue", request_id)},
         ensure_ascii=False,
     )
 
@@ -541,7 +570,7 @@ def format_client_list(rows: list[dict[str, Any]], last_seen: dict[str, str]) ->
 
     lines = ["Клиенты VPN:"]
     for row in rows:
-        profile_type = "МТС 8443" if row.get("profile_type") == "mts" else "Обычный 443"
+        profile_type = profile_label(str(row.get("profile_type") or "default"))
         email = str(row.get("client_email") or "")
         last_seen_text = format_age(last_seen.get(email))
         approved_text = format_age(str(row.get("decided_at") or row.get("created_at") or ""))
@@ -553,7 +582,7 @@ def format_client_list(rows: list[dict[str, Any]], last_seen: dict[str, str]) ->
 
 
 def format_client_card(row: dict[str, Any], last_seen: dict[str, str]) -> str:
-    profile_type = "МТС 8443" if row.get("profile_type") == "mts" else "Обычный 443"
+    profile_type = profile_label(str(row.get("profile_type") or "default"))
     email = str(row.get("client_email") or "")
     username = str(row.get("username") or "-")
     return (
@@ -656,7 +685,7 @@ def handle_message(bot: TelegramBot, store: Store, config: Config, manager: Xray
                 return
             if existing.get("status") == "approved":
                 profile_type = str(existing.get("profile_type") or "default")
-                label = f"VPN {existing['id']} {'MTS' if profile_type == 'mts' else '443'}"
+                label = f"VPN {existing['id']} {profile_short(profile_type)}"
                 link = build_vless_link(config, str(existing["uuid"]), profile_type, label)
                 bot.send_message(
                     chat_id,
@@ -666,7 +695,7 @@ def handle_message(bot: TelegramBot, store: Store, config: Config, manager: Xray
                 return
         bot.send_message(
             chat_id,
-            "Выбери своего оператора. Если VPN часто пропадает на МТС, выбирай МТС.",
+            "Выбери своего оператора. Если не знаешь, что выбрать, нажми «Обычный оператор».",
             profile_choice_markup(),
         )
         return
@@ -686,7 +715,7 @@ def handle_callback(bot: TelegramBot, store: Store, config: Config, manager: Xra
 
     if parts[0] == "request" and len(parts) == 2:
         profile_type = parts[1]
-        if profile_type not in {"default", "mts"}:
+        if not is_profile_type(profile_type):
             bot.answer_callback_query(callback_id, "Неизвестный тип профиля.")
             return
 
@@ -698,7 +727,7 @@ def handle_callback(bot: TelegramBot, store: Store, config: Config, manager: Xra
                 return
             if existing.get("status") == "approved":
                 existing_type = str(existing.get("profile_type") or "default")
-                label = f"VPN {existing['id']} {'MTS' if existing_type == 'mts' else '443'}"
+                label = f"VPN {existing['id']} {profile_short(existing_type)}"
                 link = build_vless_link(config, str(existing["uuid"]), existing_type, label)
                 bot.answer_callback_query(callback_id, "Профиль уже есть.")
                 bot.send_message(user_chat_id, "У тебя уже есть активный VPN-профиль:\n\n" + link)
@@ -706,13 +735,13 @@ def handle_callback(bot: TelegramBot, store: Store, config: Config, manager: Xra
 
         username, full_name = user_display(from_user)
         request_id = store.create_request(user_chat_id, username, full_name, profile_type)
-        profile_label = "МТС 8443" if profile_type == "mts" else "Обычный 443"
+        selected_profile_label = profile_label(profile_type)
         bot.answer_callback_query(callback_id, "Заявка отправлена.")
-        bot.send_message(user_chat_id, f"Заявка #{request_id} отправлена админу. Тип: {profile_label}.")
+        bot.send_message(user_chat_id, f"Заявка #{request_id} отправлена админу. Тип: {selected_profile_label}.")
 
         admin_text = (
             f"Новая VPN-заявка #{request_id}\n"
-            f"Тип: {profile_label}\n"
+            f"Тип: {selected_profile_label}\n"
             f"Chat ID: {user_chat_id}\n"
             f"Username: @{username if username else '-'}\n"
             f"Name: {full_name or '-'}"
@@ -724,7 +753,7 @@ def handle_callback(bot: TelegramBot, store: Store, config: Config, manager: Xra
     if parts[0] == "reissue_request" and len(parts) == 3 and parts[2].isdigit():
         profile_type = parts[1]
         request_id = int(parts[2])
-        if profile_type not in {"default", "mts"}:
+        if not is_profile_type(profile_type):
             bot.answer_callback_query(callback_id, "Неизвестный тип профиля.")
             return
         row = store.get_request(request_id)
@@ -732,13 +761,13 @@ def handle_callback(bot: TelegramBot, store: Store, config: Config, manager: Xra
             bot.answer_callback_query(callback_id, "Активный профиль не найден.")
             return
 
-        profile_label = "МТС 8443" if profile_type == "mts" else "Обычный 443"
+        selected_profile_label = profile_label(profile_type)
         bot.answer_callback_query(callback_id, "Заявка на перевыпуск отправлена.")
-        bot.send_message(user_chat_id, f"Заявка на перевыпуск профиля #{request_id} как {profile_label} отправлена админу.")
+        bot.send_message(user_chat_id, f"Заявка на перевыпуск профиля #{request_id} как {selected_profile_label} отправлена админу.")
         username, full_name = user_display(from_user)
         admin_text = (
             f"Заявка на перевыпуск VPN #{request_id}\n"
-            f"Тип: {profile_label}\n"
+            f"Тип: {selected_profile_label}\n"
             f"Chat ID: {user_chat_id}\n"
             f"Username: @{username if username else '-'}\n"
             f"Name: {full_name or '-'}"
@@ -764,7 +793,7 @@ def handle_callback(bot: TelegramBot, store: Store, config: Config, manager: Xra
     if parts[0] == "reissue" and len(parts) == 3 and parts[2].isdigit():
         profile_type = parts[1]
         request_id = int(parts[2])
-        if profile_type not in {"default", "mts"}:
+        if not is_profile_type(profile_type):
             bot.answer_callback_query(callback_id, "Неизвестный тип профиля.")
             return
         row = store.get_request(request_id)
@@ -783,11 +812,11 @@ def handle_callback(bot: TelegramBot, store: Store, config: Config, manager: Xra
             return
 
         store.update_profile(request_id, profile_type, client_email, client_uuid)
-        label = f"VPN {request_id} {'MTS' if profile_type == 'mts' else '443'}"
+        label = f"VPN {request_id} {profile_short(profile_type)}"
         link = build_vless_link(config, client_uuid, profile_type, label)
         bot.answer_callback_query(callback_id, "Ссылка перевыпущена.")
         bot.send_message(int(row["chat_id"]), "Твоя VPN-ссылка перевыпущена. Старая ссылка больше не работает:\n\n" + link)
-        bot.send_message(user_chat_id, f"Профиль #{request_id} перевыпущен как {profile_type}.")
+        bot.send_message(user_chat_id, f"Профиль #{request_id} перевыпущен как {profile_label(profile_type)}.")
         return
 
     if parts[0] == "reject" and len(parts) == 2 and parts[1].isdigit():
@@ -808,7 +837,7 @@ def handle_callback(bot: TelegramBot, store: Store, config: Config, manager: Xra
             bot.answer_callback_query(callback_id, "Заявка уже обработана.")
             return
         profile_type = str(row.get("profile_type") or "default")
-        if profile_type not in {"default", "mts"}:
+        if not is_profile_type(profile_type):
             profile_type = "default"
 
         client_uuid = str(uuid.uuid4())
@@ -822,11 +851,11 @@ def handle_callback(bot: TelegramBot, store: Store, config: Config, manager: Xra
             return
 
         store.finish_request(request_id, "approved", profile_type, client_email, client_uuid)
-        label = f"VPN {request_id} {'MTS' if profile_type == 'mts' else '443'}"
+        label = f"VPN {request_id} {profile_short(profile_type)}"
         link = build_vless_link(config, client_uuid, profile_type, label)
         bot.answer_callback_query(callback_id, "Профиль создан.")
         bot.send_message(int(row["chat_id"]), "Заявка одобрена. Твоя VPN-ссылка:\n\n" + link)
-        bot.send_message(user_chat_id, f"Готово. Заявка #{request_id} одобрена как {profile_type}.")
+        bot.send_message(user_chat_id, f"Готово. Заявка #{request_id} одобрена как {profile_label(profile_type)}.")
 
 
 def main() -> None:

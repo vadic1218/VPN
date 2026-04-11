@@ -4,17 +4,35 @@ Separate Telegram bot for issuing personal Xray/VLESS REALITY profiles after adm
 
 ## Flow
 
-1. User sends `/vpn`.
-2. Admin receives an approval request.
-3. Admin chooses `Обычный 443`, `МТС 8443`, or `Отклонить`.
+1. User sends `/vpn` or presses `Получить VPN`.
+2. User chooses an operator profile.
+3. Admin receives an approval request.
 4. Bot creates a new UUID in every VLESS inbound on the Xray server.
 5. Bot backs up the previous Xray config before changing it.
 6. If Xray fails to restart or become active, the bot restores the backup.
 7. User receives a personal `vless://` link.
 
-Admins also get a persistent `Список клиентов` button. It shows approved profiles,
-their type (`443` or `МТС 8443`), when they were created, and how long ago each
-client was last seen in Xray logs.
+## Operator Profiles
+
+The bot supports these profile types:
+
+- `Обычный оператор` -> `VPN_DEFAULT_PORT`, usually `443`.
+- `МТС` -> `VPN_MTS_PORT`, usually `8443`.
+- `МегаФон` -> `VPN_MTS_PORT`, usually `8443`.
+- `Билайн` -> `VPN_DEFAULT_PORT`, usually `443`.
+- `Tele2` -> `VPN_MTS_PORT`, usually `8443`.
+- `Yota` -> `VPN_MTS_PORT`, usually `8443`.
+- `Ростелеком` -> `VPN_DEFAULT_PORT`, usually `443`.
+- `Т-Мобайл` -> `VPN_MTS_PORT`, usually `8443`.
+- `T-Mobile` -> `VPN_ALT_PORT`, usually `2053`.
+
+Old profiles with `default` and `mts` remain valid.
+
+## Admin Features
+
+Admins get a persistent `Список клиентов` button. It shows approved profiles, selected operator profile, creation time, and how long ago each client was last seen in Xray logs.
+
+Admins can also reissue a client link into any operator profile. Reissue replaces the old UUID and resets the server-side first-IP binding for that profile.
 
 ## Setup
 
@@ -63,5 +81,4 @@ only after admin approval.
 
 - Keep `VPN_SSH_PASSWORD` out of Git.
 - `ADMIN_CHAT_IDS` can contain multiple comma-separated Telegram IDs.
-- MTS users receive `VPN_MTS_PORT`, currently `8443`.
-- Regular users receive `VPN_DEFAULT_PORT`, currently `443`.
+- Keep ports `443`, `8443`, and `2053` open on the server if all operator profiles are used.
