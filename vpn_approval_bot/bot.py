@@ -387,7 +387,6 @@ class XrayManager:
                 self._restore_backup(backup_path)
                 raise RuntimeError(f"Xray is not active after update; rolled back: {out}{err}")
 
-            self.reset_profile_guard_binding(client_email)
         finally:
             if sftp is not None:
                 sftp.close()
@@ -811,19 +810,28 @@ def handle_callback(bot: TelegramBot, store: Store, config: Config, manager: Xra
 
         client_uuid = str(uuid.uuid4())
         client_email = str(row.get("client_email") or f"tg-{row['chat_id']}-{request_id}")
+        label = f"VPN {request_id} {profile_short(profile_type)}"
+        link = build_vless_link(config, client_uuid, profile_type, label)
         bot.safe_answer_callback_query(callback_id, "Перевыпускаю ссылку...")
+        bot.send_message(
+            int(row["chat_id"]),
+            "Новая VPN-ссылка уже создана. Сейчас применяю её на сервере; старая ссылка может отключиться на несколько секунд.\n\n"
+            + link,
+        )
         try:
             manager.save_client(client_email, client_uuid)
         except Exception as exc:
             logging.exception("Failed to reissue VPN profile")
             bot.safe_answer_callback_query(callback_id, "Ошибка, конфиг не изменён или откатан.")
-            bot.send_message(user_chat_id, f"Не смог перевыпустить профиль #{request_id}: {exc}")
+            bot.send_message(
+                user_chat_id,
+                f"Не смог применить перевыпуск профиля #{request_id}: {exc}\n"
+                "Если пользователь уже получил новую ссылку, она может не заработать. Старую ссылку сервер должен был сохранить или откатить.",
+            )
             return
 
         store.update_profile(request_id, profile_type, client_email, client_uuid)
-        label = f"VPN {request_id} {profile_short(profile_type)}"
-        link = build_vless_link(config, client_uuid, profile_type, label)
-        bot.send_message(int(row["chat_id"]), "Твоя VPN-ссылка перевыпущена. Старая ссылка больше не работает:\n\n" + link)
+        bot.send_message(int(row["chat_id"]), "Готово. Новая VPN-ссылка применена на сервере. Старая ссылка больше не работает.")
         bot.send_message(user_chat_id, f"Профиль #{request_id} перевыпущен как {profile_label(profile_type)}.")
         return
 
