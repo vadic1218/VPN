@@ -12,6 +12,10 @@ Separate Telegram bot for issuing personal Xray/VLESS REALITY profiles after adm
 6. If Xray fails to restart or become active, the bot restores the backup.
 7. User receives a personal `vless://` link.
 
+Admins also get a persistent `Список клиентов` button. It shows approved profiles,
+their type (`443` or `МТС 8443`), when they were created, and how long ago each
+client was last seen in Xray logs.
+
 ## Setup
 
 Copy `.env.example` values into environment variables or create `config.json` with lowercase keys matching the env names.
@@ -36,6 +40,12 @@ Run:
 
 ```powershell
 python vpn_approval_bot\bot.py
+```
+
+Admin commands:
+
+```text
+/clients
 ```
 
 ## Notes

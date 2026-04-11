@@ -4,7 +4,7 @@ import os
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -145,6 +145,14 @@ class Store:
             if int(request["id"]) == request_id:
                 return request
         return None
+
+    def list_approved_requests(self) -> list[dict[str, Any]]:
+        data = self._read()
+        requests = [
+            request for request in data["requests"]
+            if request.get("status") == "approved" and request.get("client_email")
+        ]
+        return sorted(requests, key=lambda item: int(item["id"]))
 
     def finish_request(self, request_id: int, status: str, profile_type: str, client_email: str, client_uuid: str) -> None:
         now = datetime.utcnow().isoformat(timespec="seconds")
@@ -308,6 +316,27 @@ class XrayManager:
                 sftp.close()
             client.close()
 
+    def get_last_seen_by_email(self, emails: list[str]) -> dict[str, str]:
+        if not emails:
+            return {}
+        client = self._connect()
+        try:
+            rc, out, err = self._run(client, 'journalctl -u xray --since "30 days ago" -o short-iso --no-pager')
+            if rc != 0:
+                raise RuntimeError(f"Could not read Xray journal: {out}{err}")
+        finally:
+            client.close()
+
+        last_seen: dict[str, str] = {}
+        email_set = set(emails)
+        for line in out.splitlines():
+            for email in email_set:
+                if f"email: {email}" in line:
+                    parts = line.split(maxsplit=1)
+                    if parts:
+                        last_seen[email] = parts[0]
+        return last_seen
+
 
 def build_vless_link(config: Config, client_uuid: str, profile_type: str, label: str) -> str:
     port = config.mts_port if profile_type == "mts" else config.default_port
@@ -317,6 +346,17 @@ def build_vless_link(config: Config, client_uuid: str, profile_type: str, label:
         f"?encryption=none&flow=xtls-rprx-vision&security=reality"
         f"&sni={quote(config.vpn_sni)}&fp=chrome&pbk={quote(config.vpn_public_key)}"
         f"&sid={quote(config.vpn_short_id)}&type=tcp&headerType=none&spx=%2F#{fragment}"
+    )
+
+
+def admin_reply_markup() -> str:
+    return json.dumps(
+        {
+            "keyboard": [[{"text": "Список клиентов"}]],
+            "resize_keyboard": True,
+            "is_persistent": True,
+        },
+        ensure_ascii=False,
     )
 
 
@@ -348,6 +388,52 @@ def admin_request_markup(request_id: int) -> str:
     )
 
 
+def parse_iso_time(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def format_age(value: str | None) -> str:
+    dt = parse_iso_time(value or "")
+    if not dt:
+        return "не было подключений"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    seconds = max(0, int((now - dt).total_seconds()))
+    if seconds < 60:
+        return "только что"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes} мин назад"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours} ч назад"
+    days = hours // 24
+    return f"{days} дн назад"
+
+
+def format_client_list(rows: list[dict[str, Any]], last_seen: dict[str, str]) -> str:
+    if not rows:
+        return "Одобренных клиентов пока нет."
+
+    lines = ["Клиенты VPN:"]
+    for row in rows:
+        profile_type = "МТС 8443" if row.get("profile_type") == "mts" else "Обычный 443"
+        email = str(row.get("client_email") or "")
+        last_seen_text = format_age(last_seen.get(email))
+        approved_text = format_age(str(row.get("decided_at") or row.get("created_at") or ""))
+        username = str(row.get("username") or "-")
+        lines.append(
+            f"#{row['id']} @{username} | {profile_type} | создан {approved_text} | активность: {last_seen_text}"
+        )
+    return "\n".join(lines)
+
+
 def user_display(user: dict[str, Any]) -> tuple[str, str]:
     username = str(user.get("username") or "").strip()
     first_name = str(user.get("first_name") or "").strip()
@@ -356,7 +442,7 @@ def user_display(user: dict[str, Any]) -> tuple[str, str]:
     return username, full_name
 
 
-def handle_message(bot: TelegramBot, store: Store, config: Config, message: dict[str, Any]) -> None:
+def handle_message(bot: TelegramBot, store: Store, config: Config, manager: XrayManager, message: dict[str, Any]) -> None:
     chat = message.get("chat") or {}
     user = message.get("from") or {}
     chat_id = int(chat.get("id") or 0)
@@ -365,13 +451,30 @@ def handle_message(bot: TelegramBot, store: Store, config: Config, message: dict
         return
 
     if text.startswith("/start") or text.startswith("/help"):
+        reply_markup = admin_reply_markup() if chat_id in config.admin_chat_ids else None
         bot.send_message(
             chat_id,
             "Привет. Этот бот выдаёт VPN после одобрения админом.\n\n"
             "Команды:\n"
             "/vpn - выбрать оператора и отправить заявку на VPN\n"
-            "/vpn_status ID - проверить заявку",
+            "/vpn_status ID - проверить заявку\n"
+            "/clients - список клиентов, только для админа",
+            reply_markup,
         )
+        return
+
+    if text.startswith("/clients") or text.lower() == "список клиентов":
+        if chat_id not in config.admin_chat_ids:
+            bot.send_message(chat_id, "Эта команда доступна только админу.")
+            return
+        rows = store.list_approved_requests()
+        try:
+            last_seen = manager.get_last_seen_by_email([str(row["client_email"]) for row in rows])
+        except Exception as exc:
+            logging.exception("Failed to load client activity")
+            bot.send_message(chat_id, f"Не смог получить активность с сервера: {exc}", admin_reply_markup())
+            return
+        bot.send_message(chat_id, format_client_list(rows, last_seen), admin_reply_markup())
         return
 
     if text.startswith("/vpn_status"):
@@ -487,7 +590,7 @@ def main() -> None:
             for update in updates:
                 offset = int(update["update_id"]) + 1
                 if "message" in update:
-                    handle_message(bot, store, config, update["message"])
+                    handle_message(bot, store, config, manager, update["message"])
                 if "callback_query" in update:
                     handle_callback(bot, store, config, manager, update["callback_query"])
         except KeyboardInterrupt:
