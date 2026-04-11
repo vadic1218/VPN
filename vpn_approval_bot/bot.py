@@ -237,6 +237,16 @@ class Store:
                 self._write(data)
                 return
 
+    def disable_request(self, request_id: int) -> None:
+        now = datetime.utcnow().isoformat(timespec="seconds")
+        data = self._read()
+        for request in data["requests"]:
+            if int(request["id"]) == request_id:
+                request["status"] = "disabled"
+                request["disabled_at"] = now
+                self._write(data)
+                return
+
 
 class TelegramBot:
     def __init__(self, token: str) -> None:
@@ -392,6 +402,65 @@ class XrayManager:
                 sftp.close()
             client.close()
 
+    def remove_client(self, client_email: str) -> None:
+        client = self._connect()
+        sftp = client.open_sftp()
+        stamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+        backup_path = f"{self.config.backup_dir}/config.json.backup-vpn-disable-{stamp}"
+        try:
+            with sftp.open(self.config.xray_config_path, "r") as fh:
+                xray_config = json.load(fh)
+
+            rc, out, err = self._run(
+                client,
+                f"cp {self.config.xray_config_path} {backup_path} && chmod 600 {backup_path}",
+            )
+            if rc != 0:
+                raise RuntimeError(f"Backup failed: {out}{err}")
+
+            removed = 0
+            for inbound in xray_config.get("inbounds", []):
+                if inbound.get("protocol") != "vless":
+                    continue
+                clients = inbound.setdefault("settings", {}).setdefault("clients", [])
+                before = len(clients)
+                clients[:] = [item for item in clients if item.get("email") != client_email]
+                removed += before - len(clients)
+
+            if removed == 0:
+                raise RuntimeError(f"Client {client_email} was not found in Xray config")
+
+            candidate = "/tmp/xray-config-vpn-disable.json"
+            with sftp.open(candidate, "w") as fh:
+                fh.write(json.dumps(xray_config, ensure_ascii=False, indent=2) + "\n")
+
+            for command in (
+                f"python3 -m json.tool {candidate} >/dev/null",
+                f"install -m 600 {candidate} {self.config.xray_config_path}",
+            ):
+                rc, out, err = self._run(client, command)
+                if rc != 0:
+                    self._restore_backup(backup_path)
+                    raise RuntimeError(f"Xray update failed and was rolled back: {out}{err}")
+
+            sftp.close()
+            sftp = None
+            try:
+                self._run(client, "systemctl restart xray")
+            except Exception:
+                pass
+            client.close()
+
+            client = self._connect_with_retry()
+            rc, out, err = self._run(client, "systemctl is-active --quiet xray")
+            if rc != 0:
+                self._restore_backup(backup_path)
+                raise RuntimeError(f"Xray is not active after disable; rolled back: {out}{err}")
+        finally:
+            if sftp is not None:
+                sftp.close()
+            client.close()
+
     def reset_profile_guard_binding(self, client_email: str) -> None:
         client = self._connect()
         try:
@@ -536,8 +605,10 @@ def admin_reissue_request_markup(request_id: int, profile_type: str) -> str:
 
 
 def admin_client_markup(request_id: int) -> str:
+    rows = profile_button_rows("reissue", request_id)
+    rows.append([{"text": "Отключить пользователя", "callback_data": f"disable:{request_id}"}])
     return json.dumps(
-        {"inline_keyboard": profile_button_rows("reissue", request_id)},
+        {"inline_keyboard": rows},
         ensure_ascii=False,
     )
 
@@ -795,6 +866,27 @@ def handle_callback(bot: TelegramBot, store: Store, config: Config, manager: Xra
             return
         bot.answer_callback_query(callback_id, "Перевыпуск отклонён.")
         bot.send_message(int(row["chat_id"]), f"Админ отклонил перевыпуск профиля #{request_id}.")
+        return
+
+    if parts[0] == "disable" and len(parts) == 2 and parts[1].isdigit():
+        request_id = int(parts[1])
+        row = store.get_request(request_id)
+        if not row or row["status"] != "approved" or not row.get("client_email"):
+            bot.answer_callback_query(callback_id, "Активный профиль не найден.")
+            return
+
+        client_email = str(row["client_email"])
+        bot.safe_answer_callback_query(callback_id, "Отключаю пользователя...")
+        try:
+            manager.remove_client(client_email)
+        except Exception as exc:
+            logging.exception("Failed to disable VPN profile")
+            bot.send_message(user_chat_id, f"Не смог отключить профиль #{request_id}: {exc}")
+            return
+
+        store.disable_request(request_id)
+        bot.send_message(int(row["chat_id"]), "Твой VPN-профиль отключён админом. Старая ссылка больше не работает.")
+        bot.send_message(user_chat_id, f"Профиль #{request_id} отключён. Его старая VPN-ссылка больше не работает.")
         return
 
     if parts[0] == "reissue" and len(parts) == 3 and parts[2].isdigit():

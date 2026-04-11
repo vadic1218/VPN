@@ -34,6 +34,8 @@ Admins get a persistent `Список клиентов` button. It shows approve
 
 Admins can also reissue a client link into any operator profile. Reissue replaces the old UUID and resets the server-side first-IP binding for that profile.
 
+Admins can disable a client from the client card. Disable removes that client's UUID from Xray, so the old VPN link stops working completely and not just from a specific IP.
+
 ## Setup
 
 Copy `.env.example` values into environment variables or create `config.json` with lowercase keys matching the env names.
