@@ -654,15 +654,15 @@ def handle_callback(bot: TelegramBot, store: Store, config: Config, manager: Xra
         existing = store.get_active_request_by_chat_id(user_chat_id)
         if existing:
             if existing.get("status") == "pending":
-                bot.answer_callback_query(callback_id, "Request already pending.")
-                bot.send_message(user_chat_id, f"You already have pending request #{existing['id']}.")
+                bot.answer_callback_query(callback_id, "Заявка уже ожидает решения.")
+                bot.send_message(user_chat_id, f"У тебя уже есть заявка #{existing['id']} на рассмотрении.")
                 return
             if existing.get("status") == "approved":
                 existing_type = str(existing.get("profile_type") or "default")
                 label = f"VPN {existing['id']} {'MTS' if existing_type == 'mts' else '443'}"
                 link = build_vless_link(config, str(existing["uuid"]), existing_type, label)
-                bot.answer_callback_query(callback_id, "Profile already exists.")
-                bot.send_message(user_chat_id, "You already have an active VPN profile:\n\n" + link)
+                bot.answer_callback_query(callback_id, "Профиль уже есть.")
+                bot.send_message(user_chat_id, "У тебя уже есть активный VPN-профиль:\n\n" + link)
                 return
 
         username, full_name = user_display(from_user)
@@ -686,20 +686,20 @@ def handle_callback(bot: TelegramBot, store: Store, config: Config, manager: Xra
         profile_type = parts[1]
         request_id = int(parts[2])
         if profile_type not in {"default", "mts"}:
-            bot.answer_callback_query(callback_id, "Unknown profile type.")
+            bot.answer_callback_query(callback_id, "Неизвестный тип профиля.")
             return
         row = store.get_request(request_id)
         if not row or int(row["chat_id"]) != user_chat_id or row["status"] != "approved":
-            bot.answer_callback_query(callback_id, "Active profile not found.")
+            bot.answer_callback_query(callback_id, "Активный профиль не найден.")
             return
 
-        profile_label = "MTS 8443" if profile_type == "mts" else "Default 443"
-        bot.answer_callback_query(callback_id, "Reissue request sent.")
-        bot.send_message(user_chat_id, f"Request to reissue profile #{request_id} as {profile_label} was sent to admin.")
+        profile_label = "МТС 8443" if profile_type == "mts" else "Обычный 443"
+        bot.answer_callback_query(callback_id, "Заявка на перевыпуск отправлена.")
+        bot.send_message(user_chat_id, f"Заявка на перевыпуск профиля #{request_id} как {profile_label} отправлена админу.")
         username, full_name = user_display(from_user)
         admin_text = (
-            f"VPN reissue request #{request_id}\n"
-            f"Type: {profile_label}\n"
+            f"Заявка на перевыпуск VPN #{request_id}\n"
+            f"Тип: {profile_label}\n"
             f"Chat ID: {user_chat_id}\n"
             f"Username: @{username if username else '-'}\n"
             f"Name: {full_name or '-'}"
@@ -716,21 +716,21 @@ def handle_callback(bot: TelegramBot, store: Store, config: Config, manager: Xra
         request_id = int(parts[1])
         row = store.get_request(request_id)
         if not row or row["status"] != "approved":
-            bot.answer_callback_query(callback_id, "Active profile not found.")
+            bot.answer_callback_query(callback_id, "Активный профиль не найден.")
             return
-        bot.answer_callback_query(callback_id, "Reissue rejected.")
-        bot.send_message(int(row["chat_id"]), f"Admin rejected reissue request for profile #{request_id}.")
+        bot.answer_callback_query(callback_id, "Перевыпуск отклонён.")
+        bot.send_message(int(row["chat_id"]), f"Админ отклонил перевыпуск профиля #{request_id}.")
         return
 
     if parts[0] == "reissue" and len(parts) == 3 and parts[2].isdigit():
         profile_type = parts[1]
         request_id = int(parts[2])
         if profile_type not in {"default", "mts"}:
-            bot.answer_callback_query(callback_id, "Unknown profile type.")
+            bot.answer_callback_query(callback_id, "Неизвестный тип профиля.")
             return
         row = store.get_request(request_id)
         if not row or row["status"] != "approved":
-            bot.answer_callback_query(callback_id, "Active profile not found.")
+            bot.answer_callback_query(callback_id, "Активный профиль не найден.")
             return
 
         client_uuid = str(uuid.uuid4())
@@ -739,16 +739,16 @@ def handle_callback(bot: TelegramBot, store: Store, config: Config, manager: Xra
             manager.save_client(client_email, client_uuid)
         except Exception as exc:
             logging.exception("Failed to reissue VPN profile")
-            bot.answer_callback_query(callback_id, "Error, config was not changed or was rolled back.")
-            bot.send_message(user_chat_id, f"Could not reissue profile #{request_id}: {exc}")
+            bot.answer_callback_query(callback_id, "Ошибка, конфиг не изменён или откатан.")
+            bot.send_message(user_chat_id, f"Не смог перевыпустить профиль #{request_id}: {exc}")
             return
 
         store.update_profile(request_id, profile_type, client_email, client_uuid)
         label = f"VPN {request_id} {'MTS' if profile_type == 'mts' else '443'}"
         link = build_vless_link(config, client_uuid, profile_type, label)
-        bot.answer_callback_query(callback_id, "Link reissued.")
-        bot.send_message(int(row["chat_id"]), "Your VPN link was reissued. The old link no longer works:\n\n" + link)
-        bot.send_message(user_chat_id, f"Profile #{request_id} reissued as {profile_type}.")
+        bot.answer_callback_query(callback_id, "Ссылка перевыпущена.")
+        bot.send_message(int(row["chat_id"]), "Твоя VPN-ссылка перевыпущена. Старая ссылка больше не работает:\n\n" + link)
+        bot.send_message(user_chat_id, f"Профиль #{request_id} перевыпущен как {profile_type}.")
         return
 
     if parts[0] == "reject" and len(parts) == 2 and parts[1].isdigit():
