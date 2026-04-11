@@ -372,7 +372,24 @@ def build_vless_link(config: Config, client_uuid: str, profile_type: str, label:
 def admin_reply_markup() -> str:
     return json.dumps(
         {
-            "keyboard": [[{"text": "Список клиентов"}]],
+            "keyboard": [
+                [{"text": "Получить VPN"}, {"text": "Перевыпустить ссылку"}],
+                [{"text": "Статус заявки"}, {"text": "Список клиентов"}],
+            ],
+            "resize_keyboard": True,
+            "is_persistent": True,
+        },
+        ensure_ascii=False,
+    )
+
+
+def user_reply_markup() -> str:
+    return json.dumps(
+        {
+            "keyboard": [
+                [{"text": "Получить VPN"}],
+                [{"text": "Перевыпустить ссылку"}, {"text": "Статус заявки"}],
+            ],
             "resize_keyboard": True,
             "is_persistent": True,
         },
@@ -526,7 +543,7 @@ def handle_message(bot: TelegramBot, store: Store, config: Config, manager: Xray
         return
 
     if text.startswith("/start") or text.startswith("/help"):
-        reply_markup = admin_reply_markup() if chat_id in config.admin_chat_ids else None
+        reply_markup = admin_reply_markup() if chat_id in config.admin_chat_ids else user_reply_markup()
         bot.send_message(
             chat_id,
             "Привет. Этот бот выдаёт VPN после одобрения админом.\n\n"
@@ -557,7 +574,7 @@ def handle_message(bot: TelegramBot, store: Store, config: Config, manager: Xray
             bot.send_message(chat_id, format_client_card(row, last_seen), admin_client_markup(int(row["id"])))
         return
 
-    if text.startswith("/reissue"):
+    if text.startswith("/reissue") or text.lower() == "перевыпустить ссылку":
         existing = store.get_active_request_by_chat_id(chat_id)
         if not existing or existing.get("status") != "approved":
             bot.send_message(chat_id, "У тебя ещё нет активного VPN-профиля. Сначала напиши /vpn.")
@@ -567,6 +584,14 @@ def handle_message(bot: TelegramBot, store: Store, config: Config, manager: Xray
             f"Выбери, какую ссылку перевыпустить для профиля #{existing['id']}.",
             reissue_choice_markup(int(existing["id"])),
         )
+        return
+
+    if text.lower() == "статус заявки":
+        existing = store.get_active_request_by_chat_id(chat_id)
+        if not existing:
+            bot.send_message(chat_id, "Заявок пока нет. Нажми «Получить VPN».", user_reply_markup())
+            return
+        bot.send_message(chat_id, f"Статус заявки #{existing['id']}: {existing['status']}", user_reply_markup())
         return
 
     if text.startswith("/vpn_status"):
@@ -581,7 +606,7 @@ def handle_message(bot: TelegramBot, store: Store, config: Config, manager: Xray
         bot.send_message(chat_id, f"Статус заявки #{row['id']}: {row['status']}")
         return
 
-    if text.startswith("/vpn"):
+    if text.startswith("/vpn") or text.lower() == "получить vpn":
         existing = store.get_active_request_by_chat_id(chat_id)
         if existing:
             if existing.get("status") == "pending":
