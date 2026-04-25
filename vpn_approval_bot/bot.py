@@ -269,6 +269,22 @@ class Store:
             self._write(data)
         return imported
 
+    def update_user_info(self, chat_id: int, username: str, full_name: str) -> bool:
+        data = self._read()
+        changed = False
+        for request in data["requests"]:
+            if int(request.get("chat_id") or 0) != chat_id:
+                continue
+            if username and str(request.get("username") or "") in {"", "-"}:
+                request["username"] = username
+                changed = True
+            if full_name and str(request.get("full_name") or "") in {"", "-", "restored from xray"}:
+                request["full_name"] = full_name
+                changed = True
+        if changed:
+            self._write(data)
+        return changed
+
     def finish_request(self, request_id: int, status: str, profile_type: str, client_email: str, client_uuid: str) -> None:
         now = datetime.utcnow().isoformat(timespec="seconds")
         data = self._read()
@@ -376,6 +392,9 @@ class TelegramBot:
         if reply_markup:
             payload["reply_markup"] = reply_markup
         self._request("sendMessage", payload)
+
+    def get_chat(self, chat_id: int) -> dict[str, Any]:
+        return self._request("getChat", {"chat_id": chat_id}).get("result", {})
 
     def answer_callback_query(self, callback_query_id: str, text: str) -> None:
         self._request("answerCallbackQuery", {"callback_query_id": callback_query_id, "text": text})
@@ -798,13 +817,22 @@ def format_age(value: str | None) -> str:
 def format_client_list(rows: list[dict[str, Any]], last_seen: dict[str, str]) -> str:
     if not rows:
         return "Одобренных клиентов пока нет."
-    return f"Клиенты VPN: {len(rows)}"
+
+    lines = [f"Клиенты VPN: {len(rows)}"]
+    for number, row in enumerate(rows, start=1):
+        profile_type = profile_label(str(row.get("profile_type") or "default"))
+        email = str(row.get("client_email") or "")
+        username = format_username(str(row.get("username") or ""))
+        lines.append(
+            f"{number}. {username} | ID профиля: {row['id']} | {profile_type} | активность: {format_age(last_seen.get(email))}"
+        )
+    return "\n".join(lines)
 
 
-def format_client_card(row: dict[str, Any], last_seen: dict[str, str]) -> str:
+def format_client_card(row: dict[str, Any], last_seen: dict[str, str], number: int) -> str:
     profile_type = profile_label(str(row.get("profile_type") or "default"))
     email = str(row.get("client_email") or "")
-    username = str(row.get("username") or "-")
+    username = format_username(str(row.get("username") or ""))
     full_name = str(row.get("full_name") or "-")
     chat_id = str(row.get("chat_id") or "-")
     client_uuid = str(row.get("uuid") or "-")
@@ -813,10 +841,11 @@ def format_client_card(row: dict[str, Any], last_seen: dict[str, str]) -> str:
     decided_at = str(row.get("decided_at") or "-")
     restored = "да" if row.get("restored_from_xray") else "нет"
     return (
-        f"Клиент #{row['id']}\n"
+        f"Клиент #{number}\n"
+        f"ID профиля: {row['id']}\n"
         f"Статус: {status}\n"
         f"Chat ID: {chat_id}\n"
-        f"Username: @{username}\n"
+        f"Username: {username}\n"
         f"Имя: {full_name}\n"
         f"Тип: {profile_type}\n"
         f"Email в Xray: {email or '-'}\n"
@@ -834,6 +863,44 @@ def user_display(user: dict[str, Any]) -> tuple[str, str]:
     last_name = str(user.get("last_name") or "").strip()
     full_name = " ".join(part for part in (first_name, last_name) if part).strip()
     return username, full_name
+
+
+def format_username(username: str) -> str:
+    username = username.strip().lstrip("@")
+    if not username or username == "-":
+        return "нет username"
+    return f"@{username}"
+
+
+def chat_user_display(chat: dict[str, Any]) -> tuple[str, str]:
+    username = str(chat.get("username") or "").strip()
+    first_name = str(chat.get("first_name") or "").strip()
+    last_name = str(chat.get("last_name") or "").strip()
+    title = str(chat.get("title") or "").strip()
+    full_name = " ".join(part for part in (first_name, last_name) if part).strip() or title
+    return username, full_name
+
+
+def refresh_missing_user_info(bot: TelegramBot, store: Store, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    changed = False
+    seen_chat_ids: set[int] = set()
+    for row in rows:
+        chat_id = int(row.get("chat_id") or 0)
+        if not chat_id or chat_id in seen_chat_ids:
+            continue
+        seen_chat_ids.add(chat_id)
+        has_username = str(row.get("username") or "") not in {"", "-"}
+        has_name = str(row.get("full_name") or "") not in {"", "-", "restored from xray"}
+        if has_username and has_name:
+            continue
+        try:
+            username, full_name = chat_user_display(bot.get_chat(chat_id))
+        except Exception:
+            logging.exception("Could not refresh Telegram user info for chat_id=%s", chat_id)
+            continue
+        if store.update_user_info(chat_id, username, full_name):
+            changed = True
+    return store.list_approved_requests() if changed else rows
 
 
 def handle_message(bot: TelegramBot, store: Store, config: Config, manager: XrayManager, message: dict[str, Any]) -> None:
@@ -870,6 +937,7 @@ def handle_message(bot: TelegramBot, store: Store, config: Config, manager: Xray
                     bot.send_message(chat_id, f"Восстановил клиентов из Xray: {imported}.")
             except Exception:
                 logging.exception("Failed to restore clients from Xray")
+        rows = refresh_missing_user_info(bot, store, rows)
         try:
             last_seen = manager.get_last_seen_by_email([str(row["client_email"]) for row in rows])
         except Exception as exc:
@@ -882,8 +950,9 @@ def handle_message(bot: TelegramBot, store: Store, config: Config, manager: Xray
         if not rows:
             bot.send_message(chat_id, format_client_list(rows, last_seen), admin_reply_markup())
             return
-        for row in rows:
-            bot.send_message(chat_id, format_client_card(row, last_seen), admin_client_markup(int(row["id"])))
+        bot.send_message(chat_id, format_client_list(rows, last_seen), admin_reply_markup())
+        for number, row in enumerate(rows, start=1):
+            bot.send_message(chat_id, format_client_card(row, last_seen, number), admin_client_markup(int(row["id"])))
         return
 
     if text.startswith("/reissue") or text.lower() == "перевыпустить ссылку":
