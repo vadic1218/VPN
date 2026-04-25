@@ -91,6 +91,7 @@ VPN_SHORT_ID
 VPN_DEFAULT_PORT
 VPN_MTS_PORT
 VPN_ALT_PORT
+VPN_DEFAULT_SUBSCRIPTION_DAYS
 ```
 
 Recommended Railway values:
@@ -105,11 +106,16 @@ VPN_BACKUP_DIR=/usr/local/etc/xray
 VPN_DEFAULT_PORT=443
 VPN_MTS_PORT=8443
 VPN_ALT_PORT=2053
+VPN_DEFAULT_SUBSCRIPTION_DAYS=30
 ```
 
 If you use `DB_PATH=/data/vpn_approval.json`, attach a Railway volume mounted at `/data` so requests and clients survive restarts.
 
 On startup, the bot also tries to restore missing approved clients from the Xray config. This helps after migration to Railway if the database starts empty but the VPN profiles already exist on the server.
+
+## Subscriptions
+
+New approved users get `VPN_DEFAULT_SUBSCRIPTION_DAYS` days by default. Admin client cards include `+7 дней`, `+30 дней`, and `+90 дней` buttons. The bot checks active subscriptions every 10 minutes and removes expired VPN UUIDs from Xray.
 
 Admin commands:
 
