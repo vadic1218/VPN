@@ -36,6 +36,8 @@ Admins can also reissue a client link into any operator profile. Reissue replace
 
 Admins can disable a client from the client card. Disable removes that client's UUID from Xray, so the old VPN link stops working completely and not just from a specific IP.
 
+The bot also watches recent Xray logs for soft sharing detection. If one approved profile appears from two or more different IPs within the recent activity window, admins receive a warning with `Отключить`, `Перевыпустить`, and `Игнорировать` actions. The bot does not auto-block users from this check.
+
 ## Setup
 
 Copy `.env.example` values into environment variables or create `config.json` with lowercase keys matching the env names.

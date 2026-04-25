@@ -1,10 +1,11 @@
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -17,6 +18,12 @@ import paramiko
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 POLL_TIMEOUT = 30
+SHARING_CHECK_INTERVAL_SECONDS = 60
+SHARING_LOOKBACK_MINUTES = 10
+SHARING_ALERT_COOLDOWN_MINUTES = 30
+XRAY_USAGE_RE = re.compile(
+    r"from (?:tcp:)?(?P<ip>\d+\.\d+\.\d+\.\d+):\d+ accepted .* email: (?P<email>\S+)"
+)
 
 
 @dataclass
@@ -246,6 +253,40 @@ class Store:
                 request["disabled_at"] = now
                 self._write(data)
                 return
+
+    def mark_sharing_alert(self, client_email: str) -> None:
+        data = self._read()
+        alerts = data.setdefault("sharing_alerts", {})
+        entry = alerts.setdefault(client_email, {})
+        entry["last_alert_at"] = datetime.utcnow().isoformat(timespec="seconds")
+        self._write(data)
+
+    def ignore_sharing_alert(self, client_email: str, minutes: int = SHARING_ALERT_COOLDOWN_MINUTES) -> None:
+        data = self._read()
+        alerts = data.setdefault("sharing_alerts", {})
+        entry = alerts.setdefault(client_email, {})
+        ignored_until = datetime.utcnow() + timedelta(minutes=minutes)
+        entry["ignored_until"] = ignored_until.isoformat(timespec="seconds")
+        self._write(data)
+
+    def should_send_sharing_alert(self, client_email: str) -> bool:
+        data = self._read()
+        entry = data.get("sharing_alerts", {}).get(client_email, {})
+        now = datetime.utcnow()
+        for field in ("ignored_until", "last_alert_at"):
+            value = str(entry.get(field) or "")
+            if not value:
+                continue
+            dt = parse_iso_time(value)
+            if not dt:
+                continue
+            if dt.tzinfo is not None:
+                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+            if field == "ignored_until" and dt > now:
+                return False
+            if field == "last_alert_at" and now - dt < timedelta(minutes=SHARING_ALERT_COOLDOWN_MINUTES):
+                return False
+        return True
 
 
 class TelegramBot:
@@ -522,6 +563,29 @@ fi
                         last_seen[email] = parts[0]
         return last_seen
 
+    def get_recent_ips_by_email(self, emails: list[str], minutes: int = SHARING_LOOKBACK_MINUTES) -> dict[str, set[str]]:
+        if not emails:
+            return {}
+        client = self._connect()
+        try:
+            command = f"journalctl -u xray --since '{minutes} minutes ago' -o cat --no-pager || true"
+            rc, out, err = self._run(client, command)
+            if rc != 0:
+                raise RuntimeError((err or "Could not read Xray journal").strip()[:500])
+        finally:
+            client.close()
+
+        email_set = set(emails)
+        result: dict[str, set[str]] = {email: set() for email in email_set}
+        for line in out.splitlines():
+            match = XRAY_USAGE_RE.search(line)
+            if not match:
+                continue
+            email = match.group("email")
+            if email in email_set:
+                result[email].add(match.group("ip"))
+        return result
+
 
 def build_vless_link(config: Config, client_uuid: str, profile_type: str, label: str) -> str:
     port = profile_port(config, profile_type)
@@ -609,6 +673,23 @@ def admin_client_markup(request_id: int) -> str:
     rows.append([{"text": "Отключить пользователя", "callback_data": f"disable:{request_id}"}])
     return json.dumps(
         {"inline_keyboard": rows},
+        ensure_ascii=False,
+    )
+
+
+def sharing_alert_markup(request_id: int, profile_type: str) -> str:
+    if not is_profile_type(profile_type):
+        profile_type = "default"
+    return json.dumps(
+        {
+            "inline_keyboard": [
+                [
+                    {"text": "Отключить", "callback_data": f"disable:{request_id}"},
+                    {"text": "Перевыпустить", "callback_data": f"reissue:{profile_type}:{request_id}"},
+                ],
+                [{"text": "Игнорировать", "callback_data": f"ignore_share:{request_id}"}],
+            ]
+        },
         ensure_ascii=False,
     )
 
@@ -889,6 +970,17 @@ def handle_callback(bot: TelegramBot, store: Store, config: Config, manager: Xra
         bot.send_message(user_chat_id, f"Профиль #{request_id} отключён. Его старая VPN-ссылка больше не работает.")
         return
 
+    if parts[0] == "ignore_share" and len(parts) == 2 and parts[1].isdigit():
+        request_id = int(parts[1])
+        row = store.get_request(request_id)
+        if not row or not row.get("client_email"):
+            bot.answer_callback_query(callback_id, "Профиль не найден.")
+            return
+        store.ignore_sharing_alert(str(row["client_email"]))
+        bot.answer_callback_query(callback_id, "Ок, временно игнорирую.")
+        bot.send_message(user_chat_id, f"Подозрение по профилю #{request_id} временно скрыто.")
+        return
+
     if parts[0] == "reissue" and len(parts) == 3 and parts[2].isdigit():
         profile_type = parts[1]
         request_id = int(parts[2])
@@ -966,6 +1058,34 @@ def handle_callback(bot: TelegramBot, store: Store, config: Config, manager: Xra
         bot.send_message(user_chat_id, f"Готово. Заявка #{request_id} одобрена как {profile_label(profile_type)}.")
 
 
+def check_sharing_alerts(bot: TelegramBot, store: Store, config: Config, manager: XrayManager) -> None:
+    rows = store.list_approved_requests()
+    email_to_row = {str(row.get("client_email") or ""): row for row in rows if row.get("client_email")}
+    if not email_to_row:
+        return
+
+    recent_ips = manager.get_recent_ips_by_email(list(email_to_row), SHARING_LOOKBACK_MINUTES)
+    for email, ips in recent_ips.items():
+        if len(ips) < 2 or not store.should_send_sharing_alert(email):
+            continue
+        row = email_to_row[email]
+        request_id = int(row["id"])
+        username = str(row.get("username") or "-")
+        profile_type = str(row.get("profile_type") or "default")
+        ip_list = ", ".join(sorted(ips))
+        text = (
+            f"Подозрение на шаринг VPN #{request_id}\n"
+            f"Пользователь: @{username}\n"
+            f"Тип: {profile_label(profile_type)}\n"
+            f"За последние {SHARING_LOOKBACK_MINUTES} мин один профиль был с разных IP:\n"
+            f"{ip_list}\n\n"
+            "Это может быть пересланная ссылка. Проверь и выбери действие."
+        )
+        for admin_chat_id in config.admin_chat_ids:
+            bot.send_message(admin_chat_id, text, sharing_alert_markup(request_id, profile_type))
+        store.mark_sharing_alert(email)
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     config = load_config()
@@ -974,8 +1094,17 @@ def main() -> None:
     manager = XrayManager(config)
     logging.info("VPN approval bot started")
     offset = None
+    last_sharing_check = 0.0
     while True:
         try:
+            now = time.monotonic()
+            if now - last_sharing_check >= SHARING_CHECK_INTERVAL_SECONDS:
+                try:
+                    check_sharing_alerts(bot, store, config, manager)
+                except Exception:
+                    logging.exception("Sharing alert check failed")
+                last_sharing_check = now
+
             updates = bot.get_updates(offset=offset)
             for update in updates:
                 offset = int(update["update_id"]) + 1
