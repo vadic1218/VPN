@@ -57,6 +57,7 @@ class Config:
     backup_dir: str
     default_subscription_days: int
     payment_qr_url: str
+    payment_link: str
     payment_recipient: str
     payment_banks: str
 
@@ -131,6 +132,7 @@ def payment_comment(request_id: int) -> str:
 
 def payment_text(config: Config, request_id: int, plan_id: str | int | None, profile_type: str) -> str:
     plan = plan_info(plan_id)
+    link_text = f"\nСсылка на пополнение: {config.payment_link}\n" if config.payment_link else ""
     return (
         f"Оплата VPN #{request_id}\n"
         f"Тариф: {plan_label(plan_id)}\n"
@@ -139,12 +141,21 @@ def payment_text(config: Config, request_id: int, plan_id: str | int | None, pro
         f"Получатель: {config.payment_recipient}\n"
         f"Банк: {config.payment_banks}\n"
         f"Комментарий: {payment_comment(request_id)}\n\n"
+        f"{link_text}"
         "Оплати по QR-коду ниже. После оплаты админ вручную проверит платеж и одобрит VPN."
     )
 
 
 def qr_url_for_link(link: str) -> str:
     return f"https://api.qrserver.com/v1/create-qr-code/?size=420x420&margin=12&data={quote(link, safe='')}"
+
+
+def payment_qr_source(config: Config) -> str:
+    if config.payment_qr_url:
+        return config.payment_qr_url
+    if config.payment_link:
+        return qr_url_for_link(config.payment_link)
+    return ""
 
 
 def utc_now_iso() -> str:
@@ -229,6 +240,7 @@ def load_config() -> Config:
         backup_dir=_get(raw, "VPN_BACKUP_DIR", "/usr/local/etc/xray"),
         default_subscription_days=int(_get(raw, "VPN_DEFAULT_SUBSCRIPTION_DAYS", str(DEFAULT_SUBSCRIPTION_DAYS))),
         payment_qr_url=_get(raw, "PAYMENT_QR_URL"),
+        payment_link=_get(raw, "PAYMENT_LINK"),
         payment_recipient=_get(raw, "PAYMENT_RECIPIENT", "Вадим"),
         payment_banks=_get(raw, "PAYMENT_BANKS", "Сбер / Т-Банк"),
     )
@@ -1107,9 +1119,10 @@ def send_payment_instructions(
     reply_markup: str | None = None,
 ) -> None:
     text = payment_text(config, request_id, plan_id, profile_type)
-    if config.payment_qr_url:
+    qr_source = payment_qr_source(config)
+    if qr_source:
         try:
-            bot.send_photo(chat_id, config.payment_qr_url, text, reply_markup)
+            bot.send_photo(chat_id, qr_source, text, reply_markup)
             return
         except Exception:
             logging.exception("Could not send manual payment QR")
@@ -1357,7 +1370,7 @@ def handle_callback(
             request_id,
             plan_id,
             profile_type,
-            payment_markup(request_id, config.payment_qr_url),
+            payment_markup(request_id, config.payment_link or config.payment_qr_url),
         )
 
         admin_text = (
