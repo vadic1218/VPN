@@ -78,6 +78,7 @@ Add these variables in Railway:
 TELEGRAM_BOT_TOKEN
 ADMIN_CHAT_IDS
 DB_PATH
+REMOTE_STATE_PATH
 VPN_SSH_HOST
 VPN_SSH_PORT
 VPN_SSH_USER
@@ -104,6 +105,7 @@ Recommended Railway values:
 ```text
 ADMIN_CHAT_IDS=8611021280
 DB_PATH=/data/vpn_approval.json
+REMOTE_STATE_PATH=/usr/local/etc/xray/vpn_approval_state.json
 VPN_SSH_PORT=22
 VPN_SSH_USER=root
 XRAY_CONFIG_PATH=/usr/local/etc/xray/config.json
@@ -120,6 +122,8 @@ PAYMENT_BANKS=Сбер / Т-Банк
 ```
 
 If you use `DB_PATH=/data/vpn_approval.json`, attach a Railway volume mounted at `/data` so requests and clients survive restarts.
+
+`REMOTE_STATE_PATH` is an extra safety copy stored on the VPS. After every local database change, the bot mirrors the full approval database there. On startup, it restores from this remote copy before importing missing UUIDs from Xray, so subscription extensions and selected device limits do not fall back to default values after Railway restarts or volume resets.
 
 On startup, the bot also tries to restore missing approved clients from the Xray config. This helps after migration to Railway if the database starts empty but the VPN profiles already exist on the server.
 

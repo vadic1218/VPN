@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import time
 import uuid
 from dataclasses import dataclass
@@ -61,6 +62,7 @@ class Config:
     payment_tbank_link: str
     payment_recipient: str
     payment_banks: str
+    remote_state_path: str
 
 
 OPERATOR_PROFILES: dict[str, dict[str, str]] = {
@@ -268,6 +270,7 @@ def load_config() -> Config:
         payment_qr_url=_get(raw, "PAYMENT_QR_URL"),
         payment_link=_get(raw, "PAYMENT_LINK"),
         payment_tbank_link=_get(raw, "PAYMENT_TBANK_LINK"),
+        remote_state_path=_get(raw, "REMOTE_STATE_PATH", "/usr/local/etc/xray/vpn_approval_state.json"),
         payment_recipient=_get(raw, "PAYMENT_RECIPIENT", "Вадим"),
         payment_banks=_get(raw, "PAYMENT_BANKS", "Сбер / Т-Банк"),
     )
@@ -276,19 +279,122 @@ def load_config() -> Config:
 class Store:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
+        self.remote_backup: Any = None
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         if not self.db_path.exists():
             self._write({"last_id": 0, "requests": []})
 
+    def set_remote_backup(self, remote_backup: Any) -> None:
+        self.remote_backup = remote_backup
+
     def _read(self) -> dict[str, Any]:
         if not self.db_path.exists():
             return {"last_id": 0, "requests": []}
-        with self.db_path.open("r", encoding="utf-8") as fh:
-            return json.load(fh)
+        try:
+            with self.db_path.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except json.JSONDecodeError:
+            backup_path = self.db_path.with_suffix(self.db_path.suffix + ".broken")
+            try:
+                self.db_path.replace(backup_path)
+            except OSError:
+                pass
+            logging.exception("Local database is corrupted; moved it to %s", backup_path)
+            return {"last_id": 0, "requests": []}
+        if not isinstance(data, dict):
+            return {"last_id": 0, "requests": []}
+        data.setdefault("last_id", 0)
+        data.setdefault("requests", [])
+        return data
 
     def _write(self, data: dict[str, Any]) -> None:
-        with self.db_path.open("w", encoding="utf-8") as fh:
+        data["updated_at"] = utc_now_iso()
+        tmp_path = self.db_path.with_suffix(self.db_path.suffix + ".tmp")
+        with tmp_path.open("w", encoding="utf-8") as fh:
             json.dump(data, fh, ensure_ascii=False, indent=2)
+            fh.write("\n")
+        tmp_path.replace(self.db_path)
+        if self.remote_backup is not None:
+            try:
+                self.remote_backup(data)
+            except Exception:
+                logging.exception("Could not save remote database backup")
+
+    def export_data(self) -> dict[str, Any]:
+        return self._read()
+
+    def replace_data(self, data: dict[str, Any]) -> None:
+        self._write(self._normalize_data(data))
+
+    def merge_remote_data(self, remote_data: dict[str, Any]) -> int:
+        if not remote_data:
+            return 0
+        data = self._read()
+        merged = self._merge_data(data, remote_data)
+        if merged <= 0:
+            return 0
+        self._write(data)
+        return merged
+
+    @staticmethod
+    def _normalize_data(data: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(data) if isinstance(data, dict) else {}
+        requests = normalized.get("requests")
+        if not isinstance(requests, list):
+            requests = []
+        normalized["requests"] = [item for item in requests if isinstance(item, dict)]
+        max_id = 0
+        for request in normalized["requests"]:
+            if str(request.get("id") or "").isdigit():
+                max_id = max(max_id, int(request["id"]))
+        current_last_id = int(normalized.get("last_id") or 0) if str(normalized.get("last_id") or "").isdigit() else 0
+        normalized["last_id"] = max(current_last_id, max_id)
+        return normalized
+
+    @staticmethod
+    def _request_key(request: dict[str, Any]) -> str:
+        email = str(request.get("client_email") or "")
+        if email:
+            return f"email:{email}"
+        chat_id = str(request.get("chat_id") or "")
+        request_id = str(request.get("id") or "")
+        return f"id:{chat_id}:{request_id}"
+
+    @staticmethod
+    def _is_better_request(candidate: dict[str, Any], current: dict[str, Any]) -> bool:
+        important_fields = ("subscription_until", "plan_id", "plan_devices", "plan_price")
+        candidate_score = sum(1 for field in important_fields if candidate.get(field) not in (None, ""))
+        current_score = sum(1 for field in important_fields if current.get(field) not in (None, ""))
+        if candidate_score != current_score:
+            return candidate_score > current_score
+        candidate_updated = parse_iso_time(str(candidate.get("updated_at") or candidate.get("decided_at") or candidate.get("created_at") or ""))
+        current_updated = parse_iso_time(str(current.get("updated_at") or current.get("decided_at") or current.get("created_at") or ""))
+        if candidate_updated and current_updated:
+            return candidate_updated > current_updated
+        return bool(candidate_updated and not current_updated)
+
+    @classmethod
+    def _merge_data(cls, target: dict[str, Any], source: dict[str, Any]) -> int:
+        source = cls._normalize_data(source)
+        target.setdefault("requests", [])
+        existing_by_key = {cls._request_key(request): request for request in target["requests"] if isinstance(request, dict)}
+        merged = 0
+        for source_request in source["requests"]:
+            key = cls._request_key(source_request)
+            current = existing_by_key.get(key)
+            if current is None:
+                target["requests"].append(source_request)
+                existing_by_key[key] = source_request
+                merged += 1
+                continue
+            if cls._is_better_request(source_request, current):
+                current.update(source_request)
+                merged += 1
+        target["last_id"] = max(int(target.get("last_id") or 0), int(source.get("last_id") or 0))
+        if source.get("sharing_alerts") and not target.get("sharing_alerts"):
+            target["sharing_alerts"] = source["sharing_alerts"]
+            merged += 1
+        return merged
 
     def create_request(self, chat_id: int, username: str, full_name: str, profile_type: str, plan_id: str = "1") -> int:
         now = utc_now_iso()
@@ -650,6 +756,46 @@ class XrayManager:
                 f"install -m 600 {backup_path} {self.config.xray_config_path} && systemctl restart xray",
             )
         finally:
+            client.close()
+
+    def load_state_backup(self) -> dict[str, Any] | None:
+        client = self._connect()
+        sftp = client.open_sftp()
+        try:
+            try:
+                with sftp.open(self.config.remote_state_path, "r") as fh:
+                    state = json.load(fh)
+            except FileNotFoundError:
+                return None
+            except OSError:
+                return None
+            if isinstance(state, dict):
+                return state
+            return None
+        finally:
+            sftp.close()
+            client.close()
+
+    def save_state_backup(self, data: dict[str, Any]) -> None:
+        client = self._connect()
+        sftp = client.open_sftp()
+        remote_path = self.config.remote_state_path
+        remote_dir = remote_path.rsplit("/", 1)[0] if "/" in remote_path else "."
+        tmp_path = f"{remote_path}.tmp"
+        try:
+            rc, out, err = self._run(client, f"mkdir -p {shlex.quote(remote_dir)} && chmod 700 {shlex.quote(remote_dir)}")
+            if rc != 0:
+                raise RuntimeError(f"Could not create remote state directory: {out}{err}")
+            with sftp.open(tmp_path, "w") as fh:
+                fh.write(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+            rc, out, err = self._run(
+                client,
+                f"install -m 600 {shlex.quote(tmp_path)} {shlex.quote(remote_path)} && rm -f {shlex.quote(tmp_path)}",
+            )
+            if rc != 0:
+                raise RuntimeError(f"Could not install remote state backup: {out}{err}")
+        finally:
+            sftp.close()
             client.close()
 
     def save_client(self, client_email: str, client_uuid: str) -> None:
@@ -1711,6 +1857,23 @@ def main() -> None:
     store = Store(config.db_path)
     bot = TelegramBot(config.telegram_token)
     manager = XrayManager(config)
+    remote_state_checked = False
+    try:
+        remote_state = manager.load_state_backup()
+        remote_state_checked = True
+        if remote_state:
+            merged = store.merge_remote_data(remote_state)
+            if merged:
+                logging.info("Merged %s records from remote state backup", merged)
+    except Exception:
+        logging.exception("Could not restore remote state backup")
+    store.set_remote_backup(manager.save_state_backup)
+    try:
+        current_state = store.export_data()
+        if remote_state_checked or current_state.get("requests"):
+            manager.save_state_backup(current_state)
+    except Exception:
+        logging.exception("Could not initialize remote state backup")
     try:
         imported = store.import_approved_clients(manager.list_bot_clients())
         if imported:
