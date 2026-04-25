@@ -798,30 +798,33 @@ def format_age(value: str | None) -> str:
 def format_client_list(rows: list[dict[str, Any]], last_seen: dict[str, str]) -> str:
     if not rows:
         return "Одобренных клиентов пока нет."
-
-    lines = ["Клиенты VPN:"]
-    for row in rows:
-        profile_type = profile_label(str(row.get("profile_type") or "default"))
-        email = str(row.get("client_email") or "")
-        last_seen_text = format_age(last_seen.get(email))
-        approved_text = format_age(str(row.get("decided_at") or row.get("created_at") or ""))
-        username = str(row.get("username") or "-")
-        lines.append(
-            f"#{row['id']} @{username} | {profile_type} | создан {approved_text} | активность: {last_seen_text}"
-        )
-    return "\n".join(lines)
+    return f"Клиенты VPN: {len(rows)}"
 
 
 def format_client_card(row: dict[str, Any], last_seen: dict[str, str]) -> str:
     profile_type = profile_label(str(row.get("profile_type") or "default"))
     email = str(row.get("client_email") or "")
     username = str(row.get("username") or "-")
+    full_name = str(row.get("full_name") or "-")
+    chat_id = str(row.get("chat_id") or "-")
+    client_uuid = str(row.get("uuid") or "-")
+    status = str(row.get("status") or "-")
+    created_at = str(row.get("created_at") or "-")
+    decided_at = str(row.get("decided_at") or "-")
+    restored = "да" if row.get("restored_from_xray") else "нет"
     return (
         f"Клиент #{row['id']}\n"
+        f"Статус: {status}\n"
+        f"Chat ID: {chat_id}\n"
         f"Username: @{username}\n"
+        f"Имя: {full_name}\n"
         f"Тип: {profile_type}\n"
-        f"Создан: {format_age(str(row.get('decided_at') or row.get('created_at') or ''))}\n"
-        f"Активность: {format_age(last_seen.get(email))}"
+        f"Email в Xray: {email or '-'}\n"
+        f"UUID: {client_uuid}\n"
+        f"Создан: {created_at} ({format_age(created_at)})\n"
+        f"Одобрен/обновлён: {decided_at} ({format_age(decided_at)})\n"
+        f"Активность: {format_age(last_seen.get(email))}\n"
+        f"Восстановлен из Xray: {restored}"
     )
 
 
@@ -876,7 +879,9 @@ def handle_message(bot: TelegramBot, store: Store, config: Config, manager: Xray
                 error_text = error_text[:500] + "..."
             bot.send_message(chat_id, f"Не смог получить активность с сервера: {error_text}", admin_reply_markup())
             return
-        bot.send_message(chat_id, format_client_list(rows, last_seen), admin_reply_markup())
+        if not rows:
+            bot.send_message(chat_id, format_client_list(rows, last_seen), admin_reply_markup())
+            return
         for row in rows:
             bot.send_message(chat_id, format_client_card(row, last_seen), admin_client_markup(int(row["id"])))
         return
