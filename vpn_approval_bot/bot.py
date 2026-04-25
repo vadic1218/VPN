@@ -70,6 +70,14 @@ OPERATOR_PROFILES: dict[str, dict[str, str]] = {
     "tmobile_us": {"button": "T-Mobile", "label": "T-Mobile 2053", "short": "T-Mobile", "port": "alt"},
 }
 
+SUBSCRIPTION_PLANS: dict[str, dict[str, int]] = {
+    "1": {"devices": 1, "price": 200},
+    "2": {"devices": 2, "price": 300},
+    "3": {"devices": 3, "price": 400},
+    "4": {"devices": 4, "price": 500},
+    "5": {"devices": 5, "price": 600},
+}
+
 
 def is_profile_type(profile_type: str) -> bool:
     return profile_type in OPERATOR_PROFILES
@@ -96,6 +104,24 @@ def profile_port(config: Config, profile_type: str) -> int:
     return config.default_port
 
 
+def plan_info(plan_id: str | int | None) -> dict[str, int]:
+    return SUBSCRIPTION_PLANS.get(str(plan_id or "1"), SUBSCRIPTION_PLANS["1"])
+
+
+def plan_label(plan_id: str | int | None) -> str:
+    plan = plan_info(plan_id)
+    return f"{plan['devices']} устр. - {plan['price']} руб/мес"
+
+
+def price_list_text() -> str:
+    lines = ["Прайс лист VPN:"]
+    for plan_id in sorted(SUBSCRIPTION_PLANS, key=int):
+        lines.append(f"{plan_id}. {plan_label(plan_id)}")
+    lines.append("")
+    lines.append("После выбора тарифа бот попросит выбрать оператора и отправит заявку админу.")
+    return "\n".join(lines)
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -112,6 +138,14 @@ def profile_button_rows(callback_prefix: str, request_id: int | None = None) -> 
             callback_data = f"{callback_data}:{request_id}"
         buttons.append({"text": info["button"], "callback_data": callback_data})
     return [buttons[index : index + 2] for index in range(0, len(buttons), 2)]
+
+
+def plan_button_rows(callback_prefix: str) -> list[list[dict[str, str]]]:
+    buttons = [
+        {"text": plan_label(plan_id), "callback_data": f"{callback_prefix}:{plan_id}"}
+        for plan_id in sorted(SUBSCRIPTION_PLANS, key=int)
+    ]
+    return [buttons[index : index + 1] for index in range(0, len(buttons), 1)]
 
 
 def _get(raw: dict[str, Any], env_name: str, default: str = "") -> str:
@@ -189,12 +223,16 @@ class Store:
         with self.db_path.open("w", encoding="utf-8") as fh:
             json.dump(data, fh, ensure_ascii=False, indent=2)
 
-    def create_request(self, chat_id: int, username: str, full_name: str, profile_type: str) -> int:
-        now = datetime.utcnow().isoformat(timespec="seconds")
+    def create_request(self, chat_id: int, username: str, full_name: str, profile_type: str, plan_id: str = "1") -> int:
+        now = utc_now_iso()
+        plan = plan_info(plan_id)
         data = self._read()
         for request in reversed(data["requests"]):
             if int(request["chat_id"]) == chat_id and request["status"] == "pending":
                 request["profile_type"] = profile_type
+                request["plan_id"] = str(plan_id)
+                request["plan_devices"] = plan["devices"]
+                request["plan_price"] = plan["price"]
                 self._write(data)
                 return int(request["id"])
 
@@ -208,6 +246,9 @@ class Store:
                 "full_name": full_name,
                 "status": "pending",
                 "profile_type": profile_type,
+                "plan_id": str(plan_id),
+                "plan_devices": plan["devices"],
+                "plan_price": plan["price"],
                 "client_email": "",
                 "uuid": "",
                 "created_at": now,
@@ -266,6 +307,9 @@ class Store:
                     "full_name": "restored from xray",
                     "status": "approved",
                     "profile_type": "default",
+                    "plan_id": "1",
+                    "plan_devices": 1,
+                    "plan_price": 200,
                     "client_email": email,
                     "uuid": client_uuid,
                     "created_at": now,
@@ -768,7 +812,7 @@ def admin_reply_markup() -> str:
             "keyboard": [
                 [{"text": "Получить VPN"}, {"text": "Перевыпустить ссылку"}],
                 [{"text": "Статус заявки"}, {"text": "Моя подписка"}],
-                [{"text": "Список клиентов"}],
+                [{"text": "Прайс лист"}, {"text": "Список клиентов"}],
             ],
             "resize_keyboard": True,
             "is_persistent": True,
@@ -781,7 +825,7 @@ def user_reply_markup() -> str:
     return json.dumps(
         {
             "keyboard": [
-                [{"text": "Получить VPN"}],
+                [{"text": "Получить VPN"}, {"text": "Прайс лист"}],
                 [{"text": "Перевыпустить ссылку"}, {"text": "Статус заявки"}],
                 [{"text": "Моя подписка"}],
             ],
@@ -795,6 +839,20 @@ def user_reply_markup() -> str:
 def profile_choice_markup() -> str:
     return json.dumps(
         {"inline_keyboard": profile_button_rows("request")},
+        ensure_ascii=False,
+    )
+
+
+def plan_choice_markup() -> str:
+    return json.dumps(
+        {"inline_keyboard": plan_button_rows("plan")},
+        ensure_ascii=False,
+    )
+
+
+def profile_choice_for_plan_markup(plan_id: str) -> str:
+    return json.dumps(
+        {"inline_keyboard": profile_button_rows(f"request:{plan_id}")},
         ensure_ascii=False,
     )
 
@@ -924,8 +982,9 @@ def format_client_list(rows: list[dict[str, Any]], last_seen: dict[str, str]) ->
         email = str(row.get("client_email") or "")
         username = format_username(str(row.get("username") or ""))
         subscription = format_subscription(str(row.get("subscription_until") or ""))
+        plan = plan_label(row.get("plan_id"))
         lines.append(
-            f"{number}. {username} | ID профиля: {row['id']} | {profile_type} | подписка: {subscription} | активность: {format_age(last_seen.get(email))}"
+            f"{number}. {username} | ID профиля: {row['id']} | {profile_type} | тариф: {plan} | подписка: {subscription} | активность: {format_age(last_seen.get(email))}"
         )
     return "\n".join(lines)
 
@@ -942,12 +1001,14 @@ def format_client_card(row: dict[str, Any], last_seen: dict[str, str], number: i
     decided_at = str(row.get("decided_at") or "-")
     subscription_status = str(row.get("subscription_status") or "active")
     subscription_text = format_subscription(str(row.get("subscription_until") or ""))
+    plan = plan_label(row.get("plan_id"))
     restored = "да" if row.get("restored_from_xray") else "нет"
     return (
         f"Клиент #{number}\n"
         f"ID профиля: {row['id']}\n"
         f"Статус: {status}\n"
         f"Подписка: {subscription_status}, {subscription_text}\n"
+        f"Тариф: {plan}\n"
         f"Chat ID: {chat_id}\n"
         f"Username: {username}\n"
         f"Имя: {full_name}\n"
@@ -1020,13 +1081,20 @@ def handle_message(bot: TelegramBot, store: Store, config: Config, manager: Xray
         bot.send_message(
             chat_id,
             "Привет. Этот бот выдаёт VPN после одобрения админом.\n\n"
+            + price_list_text()
+            + "\n\n"
             "Команды:\n"
             "/vpn - выбрать оператора и отправить заявку на VPN\n"
             "/vpn_status ID - проверить заявку\n"
             "/reissue - перевыпуск ссылки\n"
+            "/price - прайс лист\n"
             "/subscription - срок подписки",
             reply_markup,
         )
+        return
+
+    if text.startswith("/price") or text.lower() == "прайс лист":
+        bot.send_message(chat_id, price_list_text(), user_reply_markup() if chat_id not in config.admin_chat_ids else admin_reply_markup())
         return
 
     if text.startswith("/clients") or text.lower() == "список клиентов":
@@ -1080,7 +1148,8 @@ def handle_message(bot: TelegramBot, store: Store, config: Config, manager: Xray
         bot.send_message(
             chat_id,
             f"Твоя VPN-подписка: {format_subscription(str(existing.get('subscription_until') or ''))}.\n"
-            f"Профиль: #{existing['id']}, {profile_label(str(existing.get('profile_type') or 'default'))}.",
+            f"Профиль: #{existing['id']}, {profile_label(str(existing.get('profile_type') or 'default'))}.\n"
+            f"Тариф: {plan_label(existing.get('plan_id'))}.",
             user_reply_markup(),
         )
         return
@@ -1093,7 +1162,8 @@ def handle_message(bot: TelegramBot, store: Store, config: Config, manager: Xray
         bot.send_message(
             chat_id,
             f"Статус заявки #{existing['id']}: {existing['status']}\n"
-            f"Подписка: {format_subscription(str(existing.get('subscription_until') or ''))}",
+            f"Подписка: {format_subscription(str(existing.get('subscription_until') or ''))}\n"
+            f"Тариф: {plan_label(existing.get('plan_id'))}",
             user_reply_markup(),
         )
         return
@@ -1110,7 +1180,8 @@ def handle_message(bot: TelegramBot, store: Store, config: Config, manager: Xray
         bot.send_message(
             chat_id,
             f"Статус заявки #{row['id']}: {row['status']}\n"
-            f"Подписка: {format_subscription(str(row.get('subscription_until') or ''))}",
+            f"Подписка: {format_subscription(str(row.get('subscription_until') or ''))}\n"
+            f"Тариф: {plan_label(row.get('plan_id'))}",
         )
         return
 
@@ -1135,8 +1206,8 @@ def handle_message(bot: TelegramBot, store: Store, config: Config, manager: Xray
                 return
         bot.send_message(
             chat_id,
-            "Выбери своего оператора. Если не знаешь, что выбрать, нажми «Обычный оператор».",
-            profile_choice_markup(),
+            "Выбери тариф подписки:\n\n" + price_list_text(),
+            plan_choice_markup(),
         )
         return
 
@@ -1153,10 +1224,27 @@ def handle_callback(bot: TelegramBot, store: Store, config: Config, manager: Xra
     if not parts:
         return
 
-    if parts[0] == "request" and len(parts) == 2:
-        profile_type = parts[1]
+    if parts[0] == "plan" and len(parts) == 2:
+        plan_id = parts[1]
+        if plan_id not in SUBSCRIPTION_PLANS:
+            bot.answer_callback_query(callback_id, "Неизвестный тариф.")
+            return
+        bot.answer_callback_query(callback_id, "Тариф выбран.")
+        bot.send_message(
+            user_chat_id,
+            f"Тариф: {plan_label(plan_id)}.\nТеперь выбери своего оператора. Если не знаешь, что выбрать, нажми «Обычный оператор».",
+            profile_choice_for_plan_markup(plan_id),
+        )
+        return
+
+    if parts[0] == "request" and len(parts) in {2, 3}:
+        plan_id = parts[1] if len(parts) == 3 else "1"
+        profile_type = parts[2] if len(parts) == 3 else parts[1]
         if not is_profile_type(profile_type):
             bot.answer_callback_query(callback_id, "Неизвестный тип профиля.")
+            return
+        if plan_id not in SUBSCRIPTION_PLANS:
+            bot.answer_callback_query(callback_id, "Неизвестный тариф.")
             return
 
         existing = store.get_active_request_by_chat_id(user_chat_id)
@@ -1174,14 +1262,16 @@ def handle_callback(bot: TelegramBot, store: Store, config: Config, manager: Xra
                 return
 
         username, full_name = user_display(from_user)
-        request_id = store.create_request(user_chat_id, username, full_name, profile_type)
+        request_id = store.create_request(user_chat_id, username, full_name, profile_type, plan_id)
         selected_profile_label = profile_label(profile_type)
+        selected_plan_label = plan_label(plan_id)
         bot.answer_callback_query(callback_id, "Заявка отправлена.")
-        bot.send_message(user_chat_id, f"Заявка #{request_id} отправлена админу. Тип: {selected_profile_label}.")
+        bot.send_message(user_chat_id, f"Заявка #{request_id} отправлена админу. Тип: {selected_profile_label}. Тариф: {selected_plan_label}.")
 
         admin_text = (
             f"Новая VPN-заявка #{request_id}\n"
             f"Тип: {selected_profile_label}\n"
+            f"Тариф: {selected_plan_label}\n"
             f"Chat ID: {user_chat_id}\n"
             f"Username: @{username if username else '-'}\n"
             f"Name: {full_name or '-'}"
@@ -1347,6 +1437,7 @@ def handle_callback(bot: TelegramBot, store: Store, config: Config, manager: Xra
         profile_type = str(row.get("profile_type") or "default")
         if not is_profile_type(profile_type):
             profile_type = "default"
+        selected_plan_label = plan_label(row.get("plan_id"))
 
         client_uuid = str(uuid.uuid4())
         client_email = f"tg-{row['chat_id']}-{request_id}"
@@ -1363,8 +1454,8 @@ def handle_callback(bot: TelegramBot, store: Store, config: Config, manager: Xra
         label = f"VPN {request_id} {profile_short(profile_type)}"
         link = build_vless_link(config, client_uuid, profile_type, label)
         subscription_text = format_subscription(subscription_until(config.default_subscription_days))
-        bot.send_message(int(row["chat_id"]), f"Заявка одобрена. Подписка: {subscription_text}.\n\nТвоя VPN-ссылка:\n\n" + link)
-        bot.send_message(user_chat_id, f"Готово. Заявка #{request_id} одобрена как {profile_label(profile_type)}. Подписка: {subscription_text}.")
+        bot.send_message(int(row["chat_id"]), f"Заявка одобрена. Тариф: {selected_plan_label}. Подписка: {subscription_text}.\n\nТвоя VPN-ссылка:\n\n" + link)
+        bot.send_message(user_chat_id, f"Готово. Заявка #{request_id} одобрена как {profile_label(profile_type)}. Тариф: {selected_plan_label}. Подписка: {subscription_text}.")
 
 
 def check_sharing_alerts(bot: TelegramBot, store: Store, config: Config, manager: XrayManager) -> None:
@@ -1375,17 +1466,21 @@ def check_sharing_alerts(bot: TelegramBot, store: Store, config: Config, manager
 
     recent_ips = manager.get_recent_ips_by_email(list(email_to_row), SHARING_LOOKBACK_MINUTES)
     for email, ips in recent_ips.items():
-        if len(ips) < 2 or not store.should_send_sharing_alert(email):
-            continue
         row = email_to_row[email]
+        allowed_devices = int(row.get("plan_devices") or plan_info(row.get("plan_id"))["devices"])
+        if len(ips) <= allowed_devices or not store.should_send_sharing_alert(email):
+            continue
         request_id = int(row["id"])
         username = str(row.get("username") or "-")
         profile_type = str(row.get("profile_type") or "default")
+        plan = plan_label(row.get("plan_id"))
         ip_list = ", ".join(sorted(ips))
         text = (
             f"Подозрение на шаринг VPN #{request_id}\n"
             f"Пользователь: @{username}\n"
             f"Тип: {profile_label(profile_type)}\n"
+            f"Тариф: {plan}\n"
+            f"Лимит устройств: {allowed_devices}\n"
             f"За последние {SHARING_LOOKBACK_MINUTES} мин один профиль был с разных IP:\n"
             f"{ip_list}\n\n"
             "Это может быть пересланная ссылка. Проверь и выбери действие."

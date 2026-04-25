@@ -117,6 +117,18 @@ On startup, the bot also tries to restore missing approved clients from the Xray
 
 New approved users get `VPN_DEFAULT_SUBSCRIPTION_DAYS` days by default. Admin client cards include `+7 дней`, `+30 дней`, and `+90 дней` buttons. The bot checks active subscriptions every 10 minutes and removes expired VPN UUIDs from Xray.
 
+User-facing tariff plans:
+
+```text
+1 device  - 200 руб/мес
+2 devices - 300 руб/мес
+3 devices - 400 руб/мес
+4 devices - 500 руб/мес
+5 devices - 600 руб/мес
+```
+
+The price list is shown after `/start` and through the `Прайс лист` button. During VPN request creation, the user selects a tariff first and then selects an operator profile.
+
 Admin commands:
 
 ```text
