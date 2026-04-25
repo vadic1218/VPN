@@ -26,6 +26,13 @@ SHARING_ALERT_COOLDOWN_MINUTES = 30
 XRAY_USAGE_RE = re.compile(
     r"from (?:tcp:)?(?P<ip>\d+\.\d+\.\d+\.\d+):\d+ accepted .* email: (?P<email>\S+)"
 )
+TG_CLIENT_EMAIL_RE = re.compile(r"^tg-(?P<chat_id>\d+)-(?P<request_id>\d+)$")
+
+
+def default_db_path() -> Path:
+    if Path("/data").is_dir() or os.getenv("RAILWAY_ENVIRONMENT"):
+        return Path("/data/vpn_approval.json")
+    return BASE_DIR / "vpn_approval.json"
 
 
 @dataclass
@@ -129,7 +136,7 @@ def load_config() -> Config:
         raise ValueError("Missing config values: " + ", ".join(missing))
 
     admin_chat_ids = {int(item.strip()) for item in admin_ids_raw.split(",") if item.strip()}
-    db_path_raw = _get(raw, "DB_PATH", str(BASE_DIR / "vpn_approval.db"))
+    db_path_raw = _get(raw, "DB_PATH", str(default_db_path()))
     db_path = Path(db_path_raw)
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -219,6 +226,48 @@ class Store:
             if request.get("status") == "approved" and request.get("client_email"):
                 latest_by_chat_id[int(request["chat_id"])] = request
         return sorted(latest_by_chat_id.values(), key=lambda item: int(item["id"]))
+
+    def import_approved_clients(self, clients: list[dict[str, str]]) -> int:
+        data = self._read()
+        existing_emails = {str(item.get("client_email") or "") for item in data["requests"]}
+        existing_ids = {int(item["id"]) for item in data["requests"] if str(item.get("id") or "").isdigit()}
+        imported = 0
+        now = datetime.utcnow().isoformat(timespec="seconds")
+
+        for client in clients:
+            email = str(client.get("email") or "")
+            client_uuid = str(client.get("uuid") or "")
+            match = TG_CLIENT_EMAIL_RE.match(email)
+            if not match or not client_uuid or email in existing_emails:
+                continue
+
+            request_id = int(match.group("request_id"))
+            while request_id in existing_ids:
+                request_id += 1
+
+            data["requests"].append(
+                {
+                    "id": request_id,
+                    "chat_id": int(match.group("chat_id")),
+                    "username": "-",
+                    "full_name": "restored from xray",
+                    "status": "approved",
+                    "profile_type": "default",
+                    "client_email": email,
+                    "uuid": client_uuid,
+                    "created_at": now,
+                    "decided_at": now,
+                    "restored_from_xray": True,
+                }
+            )
+            existing_emails.add(email)
+            existing_ids.add(request_id)
+            data["last_id"] = max(int(data.get("last_id", 0)), request_id)
+            imported += 1
+
+        if imported:
+            self._write(data)
+        return imported
 
     def finish_request(self, request_id: int, status: str, profile_type: str, client_email: str, client_uuid: str) -> None:
         now = datetime.utcnow().isoformat(timespec="seconds")
@@ -503,6 +552,27 @@ class XrayManager:
             if sftp is not None:
                 sftp.close()
             client.close()
+
+    def list_bot_clients(self) -> list[dict[str, str]]:
+        client = self._connect()
+        sftp = client.open_sftp()
+        try:
+            with sftp.open(self.config.xray_config_path, "r") as fh:
+                xray_config = json.load(fh)
+        finally:
+            sftp.close()
+            client.close()
+
+        by_email: dict[str, dict[str, str]] = {}
+        for inbound in xray_config.get("inbounds", []):
+            if inbound.get("protocol") != "vless":
+                continue
+            for item in inbound.get("settings", {}).get("clients", []):
+                email = str(item.get("email") or "")
+                client_uuid = str(item.get("id") or "")
+                if TG_CLIENT_EMAIL_RE.match(email) and client_uuid:
+                    by_email[email] = {"email": email, "uuid": client_uuid}
+        return sorted(by_email.values(), key=lambda item: item["email"])
 
     def reset_profile_guard_binding(self, client_email: str) -> None:
         client = self._connect()
@@ -789,6 +859,14 @@ def handle_message(bot: TelegramBot, store: Store, config: Config, manager: Xray
             bot.send_message(chat_id, "Эта команда доступна только админу.")
             return
         rows = store.list_approved_requests()
+        if not rows:
+            try:
+                imported = store.import_approved_clients(manager.list_bot_clients())
+                if imported:
+                    rows = store.list_approved_requests()
+                    bot.send_message(chat_id, f"Восстановил клиентов из Xray: {imported}.")
+            except Exception:
+                logging.exception("Failed to restore clients from Xray")
         try:
             last_seen = manager.get_last_seen_by_email([str(row["client_email"]) for row in rows])
         except Exception as exc:
@@ -1094,7 +1172,13 @@ def main() -> None:
     store = Store(config.db_path)
     bot = TelegramBot(config.telegram_token)
     manager = XrayManager(config)
-    logging.info("VPN approval bot started")
+    try:
+        imported = store.import_approved_clients(manager.list_bot_clients())
+        if imported:
+            logging.info("Restored %s VPN clients from Xray config", imported)
+    except Exception:
+        logging.exception("Could not restore VPN clients from Xray config")
+    logging.info("VPN approval bot started; db_path=%s", config.db_path)
     offset = None
     last_sharing_check = 0.0
     while True:

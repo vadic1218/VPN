@@ -109,6 +109,8 @@ VPN_ALT_PORT=2053
 
 If you use `DB_PATH=/data/vpn_approval.json`, attach a Railway volume mounted at `/data` so requests and clients survive restarts.
 
+On startup, the bot also tries to restore missing approved clients from the Xray config. This helps after migration to Railway if the database starts empty but the VPN profiles already exist on the server.
+
 Admin commands:
 
 ```text
