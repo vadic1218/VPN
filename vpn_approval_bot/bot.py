@@ -25,6 +25,13 @@ SUBSCRIPTION_CHECK_INTERVAL_SECONDS = 600
 SHARING_LOOKBACK_MINUTES = 10
 SHARING_ALERT_COOLDOWN_MINUTES = 30
 DEFAULT_SUBSCRIPTION_DAYS = 30
+DEFAULT_PAYMENT_QR_TEMPLATE = (
+    "Оплата VPN #{request_id}\n"
+    "Сумма: {amount} руб\n"
+    "Комментарий: {comment}\n"
+    "Получатель: {recipient}\n"
+    "Банк: {banks}"
+)
 XRAY_USAGE_RE = re.compile(
     r"from (?:tcp:)?(?P<ip>\d+\.\d+\.\d+\.\d+):\d+ accepted .* email: (?P<email>\S+)"
 )
@@ -56,7 +63,7 @@ class Config:
     alt_port: int
     backup_dir: str
     default_subscription_days: int
-    payment_qr_url: str
+    payment_qr_template: str
     payment_recipient: str
     payment_banks: str
 
@@ -125,17 +132,37 @@ def price_list_text() -> str:
     return "\n".join(lines)
 
 
-def payment_text(request_id: int, plan_id: str | int | None, profile_type: str) -> str:
+def payment_comment(request_id: int) -> str:
+    return f"VPN #{request_id}"
+
+
+def payment_text(config: Config, request_id: int, plan_id: str | int | None, profile_type: str) -> str:
     plan = plan_info(plan_id)
     return (
         f"Оплата VPN #{request_id}\n"
         f"Тариф: {plan_label(plan_id)}\n"
         f"Оператор: {profile_label(profile_type)}\n"
-        f"Сумма: {plan['price']} руб\n\n"
-        "Оплати по QR-коду ниже.\n"
-        f"Комментарий к платежу: VPN #{request_id}\n\n"
-        "После оплаты админ проверит платеж и одобрит VPN."
+        f"Сумма: {plan['price']} руб\n"
+        f"Получатель: {config.payment_recipient}\n"
+        f"Банк: {config.payment_banks}\n"
+        f"Комментарий: {payment_comment(request_id)}\n\n"
+        "Отсканируй QR-код ниже и оплати. После оплаты админ проверит платеж и одобрит VPN."
     )
+
+
+def payment_qr_url(config: Config, request_id: int, plan_id: str | int | None, profile_type: str) -> str:
+    plan = plan_info(plan_id)
+    payload = config.payment_qr_template.format(
+        request_id=request_id,
+        amount=plan["price"],
+        comment=payment_comment(request_id),
+        recipient=config.payment_recipient,
+        banks=config.payment_banks,
+        plan=plan_label(plan_id),
+        profile=profile_label(profile_type),
+    )
+    encoded = quote(payload, safe="")
+    return f"https://api.qrserver.com/v1/create-qr-code/?size=420x420&margin=12&data={encoded}"
 
 
 def utc_now_iso() -> str:
@@ -219,7 +246,7 @@ def load_config() -> Config:
         alt_port=int(_get(raw, "VPN_ALT_PORT", "2053")),
         backup_dir=_get(raw, "VPN_BACKUP_DIR", "/usr/local/etc/xray"),
         default_subscription_days=int(_get(raw, "VPN_DEFAULT_SUBSCRIPTION_DAYS", str(DEFAULT_SUBSCRIPTION_DAYS))),
-        payment_qr_url=_get(raw, "PAYMENT_QR_URL"),
+        payment_qr_template=_get(raw, "PAYMENT_QR_TEMPLATE", DEFAULT_PAYMENT_QR_TEMPLATE).replace("\\n", "\n"),
         payment_recipient=_get(raw, "PAYMENT_RECIPIENT", "Вадим"),
         payment_banks=_get(raw, "PAYMENT_BANKS", "Сбер / Т-Банк"),
     )
@@ -1080,22 +1107,12 @@ def send_payment_instructions(
     profile_type: str,
     reply_markup: str | None = None,
 ) -> None:
-    text = (
-        payment_text(request_id, plan_id, profile_type)
-        + f"\n\nПолучатель: {config.payment_recipient}"
-        + f"\nБанк: {config.payment_banks}"
-    )
-    if config.payment_qr_url:
-        try:
-            bot.send_photo(chat_id, config.payment_qr_url, text, reply_markup)
-            return
-        except Exception:
-            logging.exception("Could not send payment QR image")
-    fallback = (
-        text
-        + "\n\nQR-код оплаты пока не отправился. Напиши админу, чтобы он прислал QR-код вручную."
-    )
-    bot.send_message(chat_id, fallback, reply_markup)
+    text = payment_text(config, request_id, plan_id, profile_type)
+    try:
+        bot.send_photo(chat_id, payment_qr_url(config, request_id, plan_id, profile_type), text, reply_markup)
+    except Exception:
+        logging.exception("Could not send generated payment QR")
+        bot.send_message(chat_id, text + "\n\nQR-код не отправился. Напиши админу, чтобы он прислал QR вручную.", reply_markup)
 
 
 def refresh_missing_user_info(bot: TelegramBot, store: Store, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1326,8 +1343,8 @@ def handle_callback(bot: TelegramBot, store: Store, config: Config, manager: Xra
             f"Тип: {selected_profile_label}\n"
             f"Тариф: {selected_plan_label}\n"
             f"Сумма: {plan_info(plan_id)['price']} руб\n"
-            f"Комментарий оплаты: VPN #{request_id}\n"
-            "Перед одобрением проверь оплату по QR.\n"
+            f"Комментарий оплаты: {payment_comment(request_id)}\n"
+            "Перед одобрением проверь оплату.\n"
             f"Chat ID: {user_chat_id}\n"
             f"Username: @{username if username else '-'}\n"
             f"Name: {full_name or '-'}"
