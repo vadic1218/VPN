@@ -64,6 +64,51 @@ Run:
 python vpn_approval_bot\bot.py
 ```
 
+## Railway
+
+Deploy the repository from GitHub. Railway uses the root `railway.json` and starts the bot with:
+
+```text
+python -X utf8 vpn_approval_bot/bot.py
+```
+
+Add these variables in Railway:
+
+```text
+TELEGRAM_BOT_TOKEN
+ADMIN_CHAT_IDS
+DB_PATH
+VPN_SSH_HOST
+VPN_SSH_PORT
+VPN_SSH_USER
+VPN_SSH_PASSWORD
+XRAY_CONFIG_PATH
+VPN_BACKUP_DIR
+VPN_HOST
+VPN_SNI
+VPN_PUBLIC_KEY
+VPN_SHORT_ID
+VPN_DEFAULT_PORT
+VPN_MTS_PORT
+VPN_ALT_PORT
+```
+
+Recommended Railway values:
+
+```text
+ADMIN_CHAT_IDS=8611021280
+DB_PATH=/data/vpn_approval.json
+VPN_SSH_PORT=22
+VPN_SSH_USER=root
+XRAY_CONFIG_PATH=/usr/local/etc/xray/config.json
+VPN_BACKUP_DIR=/usr/local/etc/xray
+VPN_DEFAULT_PORT=443
+VPN_MTS_PORT=8443
+VPN_ALT_PORT=2053
+```
+
+If you use `DB_PATH=/data/vpn_approval.json`, attach a Railway volume mounted at `/data` so requests and clients survive restarts.
+
 Admin commands:
 
 ```text

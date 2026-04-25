@@ -1,4 +1,5 @@
 __pycache__/
+.pycache_tmp/
 *.pyc
 reminders.db
 config.json
