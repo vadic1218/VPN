@@ -56,6 +56,9 @@ class Config:
     alt_port: int
     backup_dir: str
     default_subscription_days: int
+    payment_qr_url: str
+    payment_recipient: str
+    payment_banks: str
 
 
 OPERATOR_PROFILES: dict[str, dict[str, str]] = {
@@ -120,6 +123,19 @@ def price_list_text() -> str:
     lines.append("")
     lines.append("После выбора тарифа бот попросит выбрать оператора и отправит заявку админу.")
     return "\n".join(lines)
+
+
+def payment_text(request_id: int, plan_id: str | int | None, profile_type: str) -> str:
+    plan = plan_info(plan_id)
+    return (
+        f"Оплата VPN #{request_id}\n"
+        f"Тариф: {plan_label(plan_id)}\n"
+        f"Оператор: {profile_label(profile_type)}\n"
+        f"Сумма: {plan['price']} руб\n\n"
+        "Оплати по QR-коду ниже.\n"
+        f"Комментарий к платежу: VPN #{request_id}\n\n"
+        "После оплаты админ проверит платеж и одобрит VPN."
+    )
 
 
 def utc_now_iso() -> str:
@@ -203,6 +219,9 @@ def load_config() -> Config:
         alt_port=int(_get(raw, "VPN_ALT_PORT", "2053")),
         backup_dir=_get(raw, "VPN_BACKUP_DIR", "/usr/local/etc/xray"),
         default_subscription_days=int(_get(raw, "VPN_DEFAULT_SUBSCRIPTION_DAYS", str(DEFAULT_SUBSCRIPTION_DAYS))),
+        payment_qr_url=_get(raw, "PAYMENT_QR_URL"),
+        payment_recipient=_get(raw, "PAYMENT_RECIPIENT", "Вадим"),
+        payment_banks=_get(raw, "PAYMENT_BANKS", "Сбер / Т-Банк"),
     )
 
 
@@ -509,6 +528,12 @@ class TelegramBot:
         if reply_markup:
             payload["reply_markup"] = reply_markup
         self._request("sendMessage", payload)
+
+    def send_photo(self, chat_id: int, photo: str, caption: str, reply_markup: str | None = None) -> None:
+        payload = {"chat_id": chat_id, "photo": photo, "caption": caption}
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        self._request("sendPhoto", payload)
 
     def get_chat(self, chat_id: int) -> dict[str, Any]:
         return self._request("getChat", {"chat_id": chat_id}).get("result", {})
@@ -1046,6 +1071,33 @@ def chat_user_display(chat: dict[str, Any]) -> tuple[str, str]:
     return username, full_name
 
 
+def send_payment_instructions(
+    bot: TelegramBot,
+    config: Config,
+    chat_id: int,
+    request_id: int,
+    plan_id: str | int | None,
+    profile_type: str,
+    reply_markup: str | None = None,
+) -> None:
+    text = (
+        payment_text(request_id, plan_id, profile_type)
+        + f"\n\nПолучатель: {config.payment_recipient}"
+        + f"\nБанк: {config.payment_banks}"
+    )
+    if config.payment_qr_url:
+        try:
+            bot.send_photo(chat_id, config.payment_qr_url, text, reply_markup)
+            return
+        except Exception:
+            logging.exception("Could not send payment QR image")
+    fallback = (
+        text
+        + "\n\nQR-код оплаты пока не отправился. Напиши админу, чтобы он прислал QR-код вручную."
+    )
+    bot.send_message(chat_id, fallback, reply_markup)
+
+
 def refresh_missing_user_info(bot: TelegramBot, store: Store, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     changed = False
     seen_chat_ids: set[int] = set()
@@ -1266,12 +1318,16 @@ def handle_callback(bot: TelegramBot, store: Store, config: Config, manager: Xra
         selected_profile_label = profile_label(profile_type)
         selected_plan_label = plan_label(plan_id)
         bot.answer_callback_query(callback_id, "Заявка отправлена.")
-        bot.send_message(user_chat_id, f"Заявка #{request_id} отправлена админу. Тип: {selected_profile_label}. Тариф: {selected_plan_label}.")
+        bot.send_message(user_chat_id, f"Заявка #{request_id} создана. Тип: {selected_profile_label}. Тариф: {selected_plan_label}.")
+        send_payment_instructions(bot, config, user_chat_id, request_id, plan_id, profile_type, user_reply_markup())
 
         admin_text = (
             f"Новая VPN-заявка #{request_id}\n"
             f"Тип: {selected_profile_label}\n"
             f"Тариф: {selected_plan_label}\n"
+            f"Сумма: {plan_info(plan_id)['price']} руб\n"
+            f"Комментарий оплаты: VPN #{request_id}\n"
+            "Перед одобрением проверь оплату по QR.\n"
             f"Chat ID: {user_chat_id}\n"
             f"Username: @{username if username else '-'}\n"
             f"Name: {full_name or '-'}"
