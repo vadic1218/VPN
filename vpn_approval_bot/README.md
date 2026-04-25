@@ -92,10 +92,9 @@ VPN_DEFAULT_PORT
 VPN_MTS_PORT
 VPN_ALT_PORT
 VPN_DEFAULT_SUBSCRIPTION_DAYS
-YOOKASSA_SHOP_ID
-YOOKASSA_SECRET_KEY
-YOOKASSA_RETURN_URL
-YOOKASSA_PAYMENT_METHOD
+PAYMENT_QR_URL
+PAYMENT_RECIPIENT
+PAYMENT_BANKS
 ```
 
 Recommended Railway values:
@@ -111,10 +110,9 @@ VPN_DEFAULT_PORT=443
 VPN_MTS_PORT=8443
 VPN_ALT_PORT=2053
 VPN_DEFAULT_SUBSCRIPTION_DAYS=30
-YOOKASSA_SHOP_ID=PASTE_YOOKASSA_SHOP_ID_HERE
-YOOKASSA_SECRET_KEY=PASTE_YOOKASSA_SECRET_KEY_HERE
-YOOKASSA_RETURN_URL=https://t.me/YOUR_BOT_USERNAME
-YOOKASSA_PAYMENT_METHOD=sbp
+PAYMENT_QR_URL=https://example.com/your-sbp-qr.png
+PAYMENT_RECIPIENT=Вадим
+PAYMENT_BANKS=СБП
 ```
 
 If you use `DB_PATH=/data/vpn_approval.json`, attach a Railway volume mounted at `/data` so requests and clients survive restarts.
@@ -137,7 +135,7 @@ User-facing tariff plans:
 
 The price list is shown after `/start` and through the `Прайс лист` button. During VPN request creation, the user selects a tariff first and then selects an operator profile.
 
-After the user selects a tariff and an operator, the bot creates a YooKassa payment with `sbp`, sends a QR code for the YooKassa confirmation URL, and stores the payment ID. Admin approval checks YooKassa first and refuses to issue VPN until the payment status is `succeeded`.
+After the user selects a tariff and an operator, the bot sends a reusable SBP QR from `PAYMENT_QR_URL` with the exact amount and comment like `VPN #15`. The user can press `Я оплатил`; the admin manually checks the incoming payment and approves the VPN request.
 
 Admin commands:
 

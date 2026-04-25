@@ -6,7 +6,6 @@ import os
 import re
 import time
 import uuid
-from base64 import b64encode
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -23,7 +22,6 @@ CONFIG_PATH = BASE_DIR / "config.json"
 POLL_TIMEOUT = 30
 SHARING_CHECK_INTERVAL_SECONDS = 60
 SUBSCRIPTION_CHECK_INTERVAL_SECONDS = 600
-PAYMENT_CHECK_INTERVAL_SECONDS = 60
 SHARING_LOOKBACK_MINUTES = 10
 SHARING_ALERT_COOLDOWN_MINUTES = 30
 DEFAULT_SUBSCRIPTION_DAYS = 30
@@ -58,10 +56,9 @@ class Config:
     alt_port: int
     backup_dir: str
     default_subscription_days: int
-    yookassa_shop_id: str
-    yookassa_secret_key: str
-    yookassa_return_url: str
-    yookassa_payment_method: str
+    payment_qr_url: str
+    payment_recipient: str
+    payment_banks: str
 
 
 OPERATOR_PROFILES: dict[str, dict[str, str]] = {
@@ -132,19 +129,17 @@ def payment_comment(request_id: int) -> str:
     return f"VPN #{request_id}"
 
 
-def yookassa_enabled(config: Config) -> bool:
-    return bool(config.yookassa_shop_id and config.yookassa_secret_key)
-
-
-def payment_text(request_id: int, plan_id: str | int | None, profile_type: str) -> str:
+def payment_text(config: Config, request_id: int, plan_id: str | int | None, profile_type: str) -> str:
     plan = plan_info(plan_id)
     return (
         f"Оплата VPN #{request_id}\n"
         f"Тариф: {plan_label(plan_id)}\n"
         f"Оператор: {profile_label(profile_type)}\n"
         f"Сумма: {plan['price']} руб\n"
+        f"Получатель: {config.payment_recipient}\n"
+        f"Банк: {config.payment_banks}\n"
         f"Комментарий: {payment_comment(request_id)}\n\n"
-        "Нажми кнопку оплаты или отсканируй QR-код. После оплаты админ проверит платеж и одобрит VPN."
+        "Оплати по QR-коду ниже. После оплаты админ вручную проверит платеж и одобрит VPN."
     )
 
 
@@ -233,10 +228,9 @@ def load_config() -> Config:
         alt_port=int(_get(raw, "VPN_ALT_PORT", "2053")),
         backup_dir=_get(raw, "VPN_BACKUP_DIR", "/usr/local/etc/xray"),
         default_subscription_days=int(_get(raw, "VPN_DEFAULT_SUBSCRIPTION_DAYS", str(DEFAULT_SUBSCRIPTION_DAYS))),
-        yookassa_shop_id=_get(raw, "YOOKASSA_SHOP_ID"),
-        yookassa_secret_key=_get(raw, "YOOKASSA_SECRET_KEY"),
-        yookassa_return_url=_get(raw, "YOOKASSA_RETURN_URL", "https://t.me/"),
-        yookassa_payment_method=_get(raw, "YOOKASSA_PAYMENT_METHOD", "sbp"),
+        payment_qr_url=_get(raw, "PAYMENT_QR_URL"),
+        payment_recipient=_get(raw, "PAYMENT_RECIPIENT", "Вадим"),
+        payment_banks=_get(raw, "PAYMENT_BANKS", "Сбер / Т-Банк"),
     )
 
 
@@ -428,44 +422,14 @@ class Store:
                 self._write(data)
                 return
 
-    def save_payment(self, request_id: int, payment_id: str, payment_url: str, payment_status: str) -> None:
-        data = self._read()
-        for request in data["requests"]:
-            if int(request["id"]) == request_id:
-                request["payment_id"] = payment_id
-                request["payment_url"] = payment_url
-                request["payment_status"] = payment_status
-                request["payment_created_at"] = utc_now_iso()
-                self._write(data)
-                return
-
     def update_payment_status(self, request_id: int, payment_status: str) -> dict[str, Any] | None:
         data = self._read()
         for request in data["requests"]:
             if int(request["id"]) == request_id:
                 request["payment_status"] = payment_status
-                request["payment_checked_at"] = utc_now_iso()
                 self._write(data)
                 return request
         return None
-
-    def mark_payment_notified(self, request_id: int) -> None:
-        data = self._read()
-        for request in data["requests"]:
-            if int(request["id"]) == request_id:
-                request["payment_notified_at"] = utc_now_iso()
-                self._write(data)
-                return
-
-    def list_pending_payment_requests(self) -> list[dict[str, Any]]:
-        data = self._read()
-        return [
-            request
-            for request in data["requests"]
-            if request.get("status") == "pending"
-            and request.get("payment_id")
-            and request.get("payment_status") not in {"succeeded", "canceled"}
-        ]
 
     def expire_request(self, request_id: int) -> None:
         now = utc_now_iso()
@@ -600,57 +564,6 @@ class TelegramBot:
             self.answer_callback_query(callback_query_id, text)
         except Exception:
             logging.warning("Could not answer callback query", exc_info=True)
-
-
-class YooKassaClient:
-    def __init__(self, config: Config) -> None:
-        self.config = config
-        credentials = f"{config.yookassa_shop_id}:{config.yookassa_secret_key}".encode("utf-8")
-        self.auth_header = "Basic " + b64encode(credentials).decode("ascii")
-
-    def _request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-        data = None
-        headers = {
-            "Authorization": self.auth_header,
-            "Accept": "application/json",
-        }
-        if payload is not None:
-            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            headers["Content-Type"] = "application/json"
-            headers["Idempotence-Key"] = str(uuid.uuid4())
-        request = Request(f"https://api.yookassa.ru/v3{path}", data=data, headers=headers, method=method)
-        try:
-            with urlopen(request, timeout=30) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"YooKassa API error {exc.code}: {detail}") from exc
-        except URLError as exc:
-            raise RuntimeError(f"YooKassa network error: {exc}") from exc
-
-    def create_payment(self, request_id: int, chat_id: int, plan_id: str, profile_type: str) -> dict[str, Any]:
-        plan = plan_info(plan_id)
-        payload = {
-            "amount": {"value": f"{plan['price']:.2f}", "currency": "RUB"},
-            "capture": True,
-            "confirmation": {
-                "type": "redirect",
-                "return_url": self.config.yookassa_return_url,
-            },
-            "description": payment_comment(request_id),
-            "metadata": {
-                "request_id": str(request_id),
-                "chat_id": str(chat_id),
-                "plan_id": str(plan_id),
-                "profile_type": profile_type,
-            },
-        }
-        if self.config.yookassa_payment_method:
-            payload["payment_method_data"] = {"type": self.config.yookassa_payment_method}
-        return self._request("POST", "/payments", payload)
-
-    def get_payment(self, payment_id: str) -> dict[str, Any]:
-        return self._request("GET", f"/payments/{quote(payment_id, safe='')}")
 
 
 class XrayManager:
@@ -1002,15 +915,11 @@ def admin_request_markup(request_id: int) -> str:
 
 
 def payment_markup(request_id: int, payment_url: str) -> str:
-    return json.dumps(
-        {
-            "inline_keyboard": [
-                [{"text": "Оплатить через СБП", "url": payment_url}],
-                [{"text": "Проверить оплату", "callback_data": f"check_payment:{request_id}"}],
-            ]
-        },
-        ensure_ascii=False,
-    )
+    rows = []
+    if payment_url:
+        rows.append([{"text": "Открыть QR оплаты", "url": payment_url}])
+    rows.append([{"text": "Я оплатил", "callback_data": f"paid:{request_id}"}])
+    return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
 
 
 def reissue_choice_markup(request_id: int) -> str:
@@ -1190,19 +1099,21 @@ def chat_user_display(chat: dict[str, Any]) -> tuple[str, str]:
 
 def send_payment_instructions(
     bot: TelegramBot,
+    config: Config,
     chat_id: int,
     request_id: int,
     plan_id: str | int | None,
     profile_type: str,
-    payment_url: str,
     reply_markup: str | None = None,
 ) -> None:
-    text = payment_text(request_id, plan_id, profile_type)
-    try:
-        bot.send_photo(chat_id, qr_url_for_link(payment_url), text, reply_markup)
-    except Exception:
-        logging.exception("Could not send YooKassa payment QR")
-        bot.send_message(chat_id, text + f"\n\nСсылка на оплату: {payment_url}", reply_markup)
+    text = payment_text(config, request_id, plan_id, profile_type)
+    if config.payment_qr_url:
+        try:
+            bot.send_photo(chat_id, config.payment_qr_url, text, reply_markup)
+            return
+        except Exception:
+            logging.exception("Could not send manual payment QR")
+    bot.send_message(chat_id, text + "\n\nQR оплаты пока не настроен. Напиши админу, чтобы он прислал QR вручную.", reply_markup)
 
 
 def refresh_missing_user_info(bot: TelegramBot, store: Store, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1232,7 +1143,6 @@ def handle_message(
     store: Store,
     config: Config,
     manager: XrayManager,
-    yookassa: YooKassaClient | None,
     message: dict[str, Any],
 ) -> None:
     chat = message.get("chat") or {}
@@ -1385,7 +1295,6 @@ def handle_callback(
     store: Store,
     config: Config,
     manager: XrayManager,
-    yookassa: YooKassaClient | None,
     callback_query: dict[str, Any],
 ) -> None:
     callback_id = str(callback_query.get("id") or "")
@@ -1440,30 +1349,16 @@ def handle_callback(
         selected_plan_label = plan_label(plan_id)
         bot.answer_callback_query(callback_id, "Заявка отправлена.")
         bot.send_message(user_chat_id, f"Заявка #{request_id} создана. Тип: {selected_profile_label}. Тариф: {selected_plan_label}.")
-        payment_status = "not_configured"
-        if yookassa:
-            try:
-                payment = yookassa.create_payment(request_id, user_chat_id, plan_id, profile_type)
-                payment_id = str(payment.get("id") or "")
-                payment_status = str(payment.get("status") or "pending")
-                payment_url = str(payment.get("confirmation", {}).get("confirmation_url") or "")
-                if not payment_id or not payment_url:
-                    raise RuntimeError(f"YooKassa did not return payment id or confirmation url: {payment}")
-                store.save_payment(request_id, payment_id, payment_url, payment_status)
-                send_payment_instructions(
-                    bot,
-                    user_chat_id,
-                    request_id,
-                    plan_id,
-                    profile_type,
-                    payment_url,
-                    payment_markup(request_id, payment_url),
-                )
-            except Exception as exc:
-                logging.exception("Failed to create YooKassa payment")
-                bot.send_message(user_chat_id, f"Заявка создана, но платеж ЮKassa не создался: {exc}\nАдмин свяжется с тобой вручную.")
-        else:
-            bot.send_message(user_chat_id, "Заявка создана, но ЮKassa пока не настроена. Админ свяжется с тобой вручную.")
+        store.update_payment_status(request_id, "waiting_manual_payment")
+        send_payment_instructions(
+            bot,
+            config,
+            user_chat_id,
+            request_id,
+            plan_id,
+            profile_type,
+            payment_markup(request_id, config.payment_qr_url),
+        )
 
         admin_text = (
             f"Новая VPN-заявка #{request_id}\n"
@@ -1471,8 +1366,7 @@ def handle_callback(
             f"Тариф: {selected_plan_label}\n"
             f"Сумма: {plan_info(plan_id)['price']} руб\n"
             f"Комментарий оплаты: {payment_comment(request_id)}\n"
-            f"Статус оплаты: {payment_status}\n"
-            "Перед одобрением бот проверит оплату в ЮKassa.\n"
+            "Перед одобрением вручную проверь оплату по QR/СБП.\n"
             f"Chat ID: {user_chat_id}\n"
             f"Username: @{username if username else '-'}\n"
             f"Name: {full_name or '-'}"
@@ -1481,34 +1375,24 @@ def handle_callback(
             bot.send_message(admin_chat_id, admin_text, admin_request_markup(request_id))
         return
 
-    if parts[0] == "check_payment" and len(parts) == 2 and parts[1].isdigit():
+    if parts[0] == "paid" and len(parts) == 2 and parts[1].isdigit():
         request_id = int(parts[1])
         row = store.get_request(request_id)
         if not row or int(row.get("chat_id") or 0) != user_chat_id:
             bot.answer_callback_query(callback_id, "Заявка не найдена.")
             return
-        payment_id = str(row.get("payment_id") or "")
-        if not yookassa or not payment_id:
-            bot.answer_callback_query(callback_id, "Платеж не найден.")
-            bot.send_message(user_chat_id, "Платеж по этой заявке не найден. Напиши админу.")
-            return
-        try:
-            payment = yookassa.get_payment(payment_id)
-        except Exception as exc:
-            logging.exception("Failed to check YooKassa payment")
-            bot.answer_callback_query(callback_id, "Не смог проверить оплату.")
-            bot.send_message(user_chat_id, f"Не смог проверить оплату: {exc}")
-            return
-        payment_status = str(payment.get("status") or "")
-        store.update_payment_status(request_id, payment_status)
-        if payment_status == "succeeded":
-            bot.answer_callback_query(callback_id, "Оплата найдена.")
-            bot.send_message(user_chat_id, "Оплата найдена. Теперь админ может одобрить VPN.")
-            for admin_chat_id in config.admin_chat_ids:
-                bot.send_message(admin_chat_id, f"Оплата по заявке #{request_id} прошла. Можно одобрять VPN.")
-        else:
-            bot.answer_callback_query(callback_id, f"Статус: {payment_status}")
-            bot.send_message(user_chat_id, f"Оплата пока не подтверждена. Статус ЮKassa: {payment_status}")
+        store.update_payment_status(request_id, "user_marked_paid")
+        bot.answer_callback_query(callback_id, "Сообщил админу.")
+        bot.send_message(user_chat_id, "Спасибо. Я сообщил админу, что ты оплатил. Он проверит платеж и одобрит VPN.")
+        for admin_chat_id in config.admin_chat_ids:
+            bot.send_message(
+                admin_chat_id,
+                f"Пользователь отметил оплату по заявке #{request_id}.\n"
+                f"Сумма: {row.get('plan_price') or plan_info(row.get('plan_id'))['price']} руб\n"
+                f"Комментарий: {payment_comment(request_id)}\n"
+                "Проверь поступление вручную и нажми «Одобрить», если все хорошо.",
+                admin_request_markup(request_id),
+            )
         return
 
     if parts[0] == "reissue_request" and len(parts) == 3 and parts[2].isdigit():
@@ -1665,25 +1549,6 @@ def handle_callback(
         if not row or row["status"] != "pending":
             bot.answer_callback_query(callback_id, "Заявка уже обработана.")
             return
-        payment_id = str(row.get("payment_id") or "")
-        if yookassa_enabled(config):
-            if not yookassa or not payment_id:
-                bot.answer_callback_query(callback_id, "У заявки нет платежа.")
-                bot.send_message(user_chat_id, f"Не одобряю заявку #{request_id}: платеж ЮKassa не найден.")
-                return
-            try:
-                payment = yookassa.get_payment(payment_id)
-            except Exception as exc:
-                logging.exception("Failed to verify YooKassa payment before approval")
-                bot.answer_callback_query(callback_id, "Не смог проверить оплату.")
-                bot.send_message(user_chat_id, f"Не одобряю заявку #{request_id}: не смог проверить оплату: {exc}")
-                return
-            payment_status = str(payment.get("status") or "")
-            store.update_payment_status(request_id, payment_status)
-            if payment_status != "succeeded":
-                bot.answer_callback_query(callback_id, "Оплата не подтверждена.")
-                bot.send_message(user_chat_id, f"Заявка #{request_id} не одобрена: статус оплаты ЮKassa = {payment_status}.")
-                return
         profile_type = str(row.get("profile_type") or "default")
         if not is_profile_type(profile_type):
             profile_type = "default"
@@ -1759,32 +1624,12 @@ def check_expired_subscriptions(bot: TelegramBot, store: Store, config: Config, 
             bot.send_message(admin_chat_id, f"{text}\nПользователь: {username}\nChat ID: {row['chat_id']}")
 
 
-def check_pending_payments(bot: TelegramBot, store: Store, config: Config, yookassa: YooKassaClient | None) -> None:
-    if not yookassa:
-        return
-    for row in store.list_pending_payment_requests():
-        request_id = int(row["id"])
-        try:
-            payment = yookassa.get_payment(str(row["payment_id"]))
-        except Exception:
-            logging.exception("Failed to poll YooKassa payment for request #%s", request_id)
-            continue
-        payment_status = str(payment.get("status") or "")
-        updated = store.update_payment_status(request_id, payment_status)
-        if payment_status == "succeeded" and updated and not updated.get("payment_notified_at"):
-            bot.send_message(int(row["chat_id"]), "Оплата найдена. Теперь админ может одобрить VPN.")
-            for admin_chat_id in config.admin_chat_ids:
-                bot.send_message(admin_chat_id, f"Оплата по заявке #{request_id} прошла. Можно одобрять VPN.")
-            store.mark_payment_notified(request_id)
-
-
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     config = load_config()
     store = Store(config.db_path)
     bot = TelegramBot(config.telegram_token)
     manager = XrayManager(config)
-    yookassa = YooKassaClient(config) if yookassa_enabled(config) else None
     try:
         imported = store.import_approved_clients(manager.list_bot_clients())
         if imported:
@@ -1795,17 +1640,9 @@ def main() -> None:
     offset = None
     last_sharing_check = 0.0
     last_subscription_check = 0.0
-    last_payment_check = 0.0
     while True:
         try:
             now = time.monotonic()
-            if now - last_payment_check >= PAYMENT_CHECK_INTERVAL_SECONDS:
-                try:
-                    check_pending_payments(bot, store, config, yookassa)
-                except Exception:
-                    logging.exception("Payment check failed")
-                last_payment_check = now
-
             if now - last_subscription_check >= SUBSCRIPTION_CHECK_INTERVAL_SECONDS:
                 try:
                     check_expired_subscriptions(bot, store, config, manager)
@@ -1824,9 +1661,9 @@ def main() -> None:
             for update in updates:
                 offset = int(update["update_id"]) + 1
                 if "message" in update:
-                    handle_message(bot, store, config, manager, yookassa, update["message"])
+                    handle_message(bot, store, config, manager, update["message"])
                 if "callback_query" in update:
-                    handle_callback(bot, store, config, manager, yookassa, update["callback_query"])
+                    handle_callback(bot, store, config, manager, update["callback_query"])
         except KeyboardInterrupt:
             logging.info("Stopped by user")
             break
