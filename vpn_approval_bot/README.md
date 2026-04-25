@@ -94,6 +94,7 @@ VPN_ALT_PORT
 VPN_DEFAULT_SUBSCRIPTION_DAYS
 PAYMENT_QR_URL
 PAYMENT_LINK
+PAYMENT_TBANK_LINK
 PAYMENT_RECIPIENT
 PAYMENT_BANKS
 ```
@@ -112,9 +113,10 @@ VPN_MTS_PORT=8443
 VPN_ALT_PORT=2053
 VPN_DEFAULT_SUBSCRIPTION_DAYS=30
 PAYMENT_LINK=https://www.sberbank.com/sms/pbpn?requisiteNumber=79050122709
+PAYMENT_TBANK_LINK=https://www.tinkoff.ru/rm/r_fpDGcUCZRx.uCrfsYPegf/WuswZ21804
 PAYMENT_QR_URL=
 PAYMENT_RECIPIENT=Вадим
-PAYMENT_BANKS=Сбер / СБП
+PAYMENT_BANKS=Сбер / Т-Банк
 ```
 
 If you use `DB_PATH=/data/vpn_approval.json`, attach a Railway volume mounted at `/data` so requests and clients survive restarts.
@@ -137,7 +139,7 @@ User-facing tariff plans:
 
 The price list is shown after `/start` and through the `Прайс лист` button. During VPN request creation, the user selects a tariff first and then selects an operator profile.
 
-After the user selects a tariff and an operator, the bot sends a reusable payment QR. If `PAYMENT_LINK` is set, the bot generates a QR code for that link and also includes the link in the message. If `PAYMENT_QR_URL` is set, that image is used instead. The message includes the exact amount and comment like `VPN #15`. The user can press `Я оплатил`; the admin manually checks the incoming payment and approves the VPN request.
+After the user selects a tariff and an operator, the bot asks whether they want to pay through Sber or T-Bank. `PAYMENT_LINK` is used for Sber, `PAYMENT_TBANK_LINK` is used for T-Bank, and `PAYMENT_QR_URL` can override the Sber QR image. The message includes the exact amount and comment like `VPN #15`. The user can press `Я оплатил`; the admin manually checks the incoming payment and approves the VPN request.
 
 Admin commands:
 

@@ -58,6 +58,7 @@ class Config:
     default_subscription_days: int
     payment_qr_url: str
     payment_link: str
+    payment_tbank_link: str
     payment_recipient: str
     payment_banks: str
 
@@ -130,16 +131,40 @@ def payment_comment(request_id: int) -> str:
     return f"VPN #{request_id}"
 
 
-def payment_text(config: Config, request_id: int, plan_id: str | int | None, profile_type: str) -> str:
+def payment_methods(config: Config) -> dict[str, dict[str, str]]:
+    methods: dict[str, dict[str, str]] = {}
+    if config.payment_link or config.payment_qr_url:
+        methods["sber"] = {
+            "label": "Сбер",
+            "link": config.payment_link,
+            "qr_url": config.payment_qr_url,
+        }
+    if config.payment_tbank_link:
+        methods["tbank"] = {
+            "label": "Т-Банк",
+            "link": config.payment_tbank_link,
+            "qr_url": "",
+        }
+    return methods
+
+
+def payment_method_info(config: Config, payment_method: str) -> dict[str, str]:
+    methods = payment_methods(config)
+    return methods.get(payment_method) or methods.get("sber") or methods.get("tbank") or {"label": config.payment_banks, "link": "", "qr_url": ""}
+
+
+def payment_text(config: Config, request_id: int, plan_id: str | int | None, profile_type: str, payment_method: str) -> str:
     plan = plan_info(plan_id)
-    link_text = f"\nСсылка на пополнение: {config.payment_link}\n" if config.payment_link else ""
+    method = payment_method_info(config, payment_method)
+    payment_link = method.get("link") or ""
+    link_text = f"\nСсылка на пополнение: {payment_link}\n" if payment_link else ""
     return (
         f"Оплата VPN #{request_id}\n"
         f"Тариф: {plan_label(plan_id)}\n"
         f"Оператор: {profile_label(profile_type)}\n"
         f"Сумма: {plan['price']} руб\n"
         f"Получатель: {config.payment_recipient}\n"
-        f"Банк: {config.payment_banks}\n"
+        f"Банк: {method['label']}\n"
         f"Комментарий: {payment_comment(request_id)}\n\n"
         f"{link_text}"
         "Оплати по QR-коду ниже. После оплаты админ вручную проверит платеж и одобрит VPN."
@@ -150,11 +175,12 @@ def qr_url_for_link(link: str) -> str:
     return f"https://api.qrserver.com/v1/create-qr-code/?size=420x420&margin=12&data={quote(link, safe='')}"
 
 
-def payment_qr_source(config: Config) -> str:
-    if config.payment_qr_url:
-        return config.payment_qr_url
-    if config.payment_link:
-        return qr_url_for_link(config.payment_link)
+def payment_qr_source(config: Config, payment_method: str) -> str:
+    method = payment_method_info(config, payment_method)
+    if method.get("qr_url"):
+        return str(method["qr_url"])
+    if method.get("link"):
+        return qr_url_for_link(str(method["link"]))
     return ""
 
 
@@ -241,6 +267,7 @@ def load_config() -> Config:
         default_subscription_days=int(_get(raw, "VPN_DEFAULT_SUBSCRIPTION_DAYS", str(DEFAULT_SUBSCRIPTION_DAYS))),
         payment_qr_url=_get(raw, "PAYMENT_QR_URL"),
         payment_link=_get(raw, "PAYMENT_LINK"),
+        payment_tbank_link=_get(raw, "PAYMENT_TBANK_LINK"),
         payment_recipient=_get(raw, "PAYMENT_RECIPIENT", "Вадим"),
         payment_banks=_get(raw, "PAYMENT_BANKS", "Сбер / Т-Банк"),
     )
@@ -912,6 +939,20 @@ def profile_choice_for_plan_markup(plan_id: str) -> str:
     )
 
 
+def payment_method_markup(plan_id: str, profile_type: str) -> str:
+    return json.dumps(
+        {
+            "inline_keyboard": [
+                [
+                    {"text": "Сбер", "callback_data": f"paymethod:sber:{plan_id}:{profile_type}"},
+                    {"text": "Т-Банк", "callback_data": f"paymethod:tbank:{plan_id}:{profile_type}"},
+                ]
+            ]
+        },
+        ensure_ascii=False,
+    )
+
+
 def admin_request_markup(request_id: int) -> str:
     return json.dumps(
         {
@@ -1116,10 +1157,11 @@ def send_payment_instructions(
     request_id: int,
     plan_id: str | int | None,
     profile_type: str,
+    payment_method: str,
     reply_markup: str | None = None,
 ) -> None:
-    text = payment_text(config, request_id, plan_id, profile_type)
-    qr_source = payment_qr_source(config)
+    text = payment_text(config, request_id, plan_id, profile_type, payment_method)
+    qr_source = payment_qr_source(config, payment_method)
     if qr_source:
         try:
             bot.send_photo(chat_id, qr_source, text, reply_markup)
@@ -1342,6 +1384,28 @@ def handle_callback(
             bot.answer_callback_query(callback_id, "Неизвестный тариф.")
             return
 
+        bot.answer_callback_query(callback_id, "Оператор выбран.")
+        bot.send_message(
+            user_chat_id,
+            "Выбери, через какой банк тебе удобнее оплатить:",
+            payment_method_markup(plan_id, profile_type),
+        )
+        return
+
+    if parts[0] == "paymethod" and len(parts) == 4:
+        payment_method = parts[1]
+        plan_id = parts[2]
+        profile_type = parts[3]
+        if payment_method not in payment_methods(config):
+            bot.answer_callback_query(callback_id, "Этот способ оплаты не настроен.")
+            return
+        if plan_id not in SUBSCRIPTION_PLANS:
+            bot.answer_callback_query(callback_id, "Неизвестный тариф.")
+            return
+        if not is_profile_type(profile_type):
+            bot.answer_callback_query(callback_id, "Неизвестный тип профиля.")
+            return
+
         existing = store.get_active_request_by_chat_id(user_chat_id)
         if existing:
             if existing.get("status") == "pending":
@@ -1363,6 +1427,8 @@ def handle_callback(
         bot.answer_callback_query(callback_id, "Заявка отправлена.")
         bot.send_message(user_chat_id, f"Заявка #{request_id} создана. Тип: {selected_profile_label}. Тариф: {selected_plan_label}.")
         store.update_payment_status(request_id, "waiting_manual_payment")
+        payment_method_name = payment_method_info(config, payment_method)["label"]
+        payment_info = payment_method_info(config, payment_method)
         send_payment_instructions(
             bot,
             config,
@@ -1370,13 +1436,15 @@ def handle_callback(
             request_id,
             plan_id,
             profile_type,
-            payment_markup(request_id, config.payment_link or config.payment_qr_url),
+            payment_method,
+            payment_markup(request_id, payment_info.get("link", "") or payment_info.get("qr_url", "")),
         )
 
         admin_text = (
             f"Новая VPN-заявка #{request_id}\n"
             f"Тип: {selected_profile_label}\n"
             f"Тариф: {selected_plan_label}\n"
+            f"Оплата через: {payment_method_name}\n"
             f"Сумма: {plan_info(plan_id)['price']} руб\n"
             f"Комментарий оплаты: {payment_comment(request_id)}\n"
             "Перед одобрением вручную проверь оплату по QR/СБП.\n"
