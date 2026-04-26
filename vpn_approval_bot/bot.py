@@ -178,6 +178,23 @@ def qr_url_for_link(link: str) -> str:
     return f"https://api.qrserver.com/v1/create-qr-code/?size=420x420&margin=12&data={quote(link, safe='')}"
 
 
+def plan_change_payment_text(config: Config, request_id: int, plan_id: str | int | None, payment_method: str) -> str:
+    plan = plan_info(plan_id)
+    method = payment_method_info(config, payment_method)
+    payment_link = method.get("link") or ""
+    link_text = f"\nСсылка на пополнение: {payment_link}\n" if payment_link else ""
+    return (
+        f"Оплата смены тарифа VPN #{request_id}\n"
+        f"Новый тариф: {plan_label(plan_id)}\n"
+        f"Сумма: {plan['price']} руб\n"
+        f"Получатель: {config.payment_recipient}\n"
+        f"Банк: {method['label']}\n"
+        f"Комментарий: {payment_comment(request_id)} тариф\n\n"
+        f"{link_text}"
+        "Оплати по QR-коду ниже. После оплаты админ вручную проверит платеж и сменит тариф."
+    )
+
+
 def payment_qr_source(config: Config, payment_method: str) -> str:
     method = payment_method_info(config, payment_method)
     if method.get("qr_url"):
@@ -604,6 +621,76 @@ class Store:
             request["subscription_status"] = "active"
             if request.get("status") == "expired":
                 request["status"] = "approved"
+            self._write(data)
+            return request
+        return None
+
+    def request_plan_change(self, request_id: int, plan_id: str, payment_method: str) -> dict[str, Any] | None:
+        plan = plan_info(plan_id)
+        data = self._read()
+        for request in data["requests"]:
+            if int(request["id"]) != request_id:
+                continue
+            request["pending_plan_id"] = str(plan_id)
+            request["pending_plan_devices"] = plan["devices"]
+            request["pending_plan_price"] = plan["price"]
+            request["pending_plan_payment_method"] = payment_method
+            request["pending_plan_requested_at"] = utc_now_iso()
+            request["pending_plan_status"] = "waiting_manual_payment"
+            self._write(data)
+            return request
+        return None
+
+    def update_plan_change_payment_status(self, request_id: int, payment_status: str) -> dict[str, Any] | None:
+        data = self._read()
+        for request in data["requests"]:
+            if int(request["id"]) != request_id:
+                continue
+            request["pending_plan_status"] = payment_status
+            self._write(data)
+            return request
+        return None
+
+    def approve_plan_change(self, request_id: int) -> dict[str, Any] | None:
+        data = self._read()
+        for request in data["requests"]:
+            if int(request["id"]) != request_id:
+                continue
+            pending_plan_id = str(request.get("pending_plan_id") or "")
+            if pending_plan_id not in SUBSCRIPTION_PLANS:
+                return None
+            plan = plan_info(pending_plan_id)
+            request["plan_id"] = pending_plan_id
+            request["plan_devices"] = plan["devices"]
+            request["plan_price"] = plan["price"]
+            request["plan_changed_at"] = utc_now_iso()
+            request["pending_plan_status"] = "approved"
+            for field in (
+                "pending_plan_id",
+                "pending_plan_devices",
+                "pending_plan_price",
+                "pending_plan_payment_method",
+                "pending_plan_requested_at",
+            ):
+                request.pop(field, None)
+            self._write(data)
+            return request
+        return None
+
+    def reject_plan_change(self, request_id: int) -> dict[str, Any] | None:
+        data = self._read()
+        for request in data["requests"]:
+            if int(request["id"]) != request_id:
+                continue
+            request["pending_plan_status"] = "rejected"
+            for field in (
+                "pending_plan_id",
+                "pending_plan_devices",
+                "pending_plan_price",
+                "pending_plan_payment_method",
+                "pending_plan_requested_at",
+            ):
+                request.pop(field, None)
             self._write(data)
             return request
         return None
@@ -1040,7 +1127,8 @@ def admin_reply_markup() -> str:
         {
             "keyboard": [
                 [{"text": "Получить VPN"}, {"text": "Перевыпустить ссылку"}],
-                [{"text": "Статус заявки"}, {"text": "Моя подписка"}],
+                [{"text": "Сменить тариф"}, {"text": "Моя подписка"}],
+                [{"text": "Статус заявки"}],
                 [{"text": "Прайс лист"}, {"text": "Список клиентов"}],
             ],
             "resize_keyboard": True,
@@ -1056,7 +1144,7 @@ def user_reply_markup() -> str:
             "keyboard": [
                 [{"text": "Получить VPN"}, {"text": "Прайс лист"}],
                 [{"text": "Перевыпустить ссылку"}, {"text": "Статус заявки"}],
-                [{"text": "Моя подписка"}],
+                [{"text": "Сменить тариф"}, {"text": "Моя подписка"}],
             ],
             "resize_keyboard": True,
             "is_persistent": True,
@@ -1075,6 +1163,13 @@ def profile_choice_markup() -> str:
 def plan_choice_markup() -> str:
     return json.dumps(
         {"inline_keyboard": plan_button_rows("plan")},
+        ensure_ascii=False,
+    )
+
+
+def plan_change_choice_markup() -> str:
+    return json.dumps(
+        {"inline_keyboard": plan_button_rows("changeplan")},
         ensure_ascii=False,
     )
 
@@ -1100,6 +1195,20 @@ def payment_method_markup(plan_id: str, profile_type: str) -> str:
     )
 
 
+def plan_change_payment_method_markup(request_id: int, plan_id: str) -> str:
+    return json.dumps(
+        {
+            "inline_keyboard": [
+                [
+                    {"text": "Сбер", "callback_data": f"changeplanpay:sber:{request_id}:{plan_id}"},
+                    {"text": "Т-Банк", "callback_data": f"changeplanpay:tbank:{request_id}:{plan_id}"},
+                ]
+            ]
+        },
+        ensure_ascii=False,
+    )
+
+
 def admin_request_markup(request_id: int) -> str:
     return json.dumps(
         {
@@ -1114,11 +1223,33 @@ def admin_request_markup(request_id: int) -> str:
     )
 
 
+def admin_plan_change_markup(request_id: int) -> str:
+    return json.dumps(
+        {
+            "inline_keyboard": [
+                [
+                    {"text": "Одобрить смену тарифа", "callback_data": f"approve_plan:{request_id}"},
+                    {"text": "Отклонить", "callback_data": f"reject_plan:{request_id}"},
+                ]
+            ]
+        },
+        ensure_ascii=False,
+    )
+
+
 def payment_markup(request_id: int, payment_url: str) -> str:
     rows = []
     if payment_url:
         rows.append([{"text": "Открыть QR оплаты", "url": payment_url}])
     rows.append([{"text": "Я оплатил", "callback_data": f"paid:{request_id}"}])
+    return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
+
+
+def plan_change_payment_markup(request_id: int, payment_url: str) -> str:
+    rows = []
+    if payment_url:
+        rows.append([{"text": "Открыть QR оплаты", "url": payment_url}])
+    rows.append([{"text": "Я оплатил смену тарифа", "callback_data": f"planpaid:{request_id}"}])
     return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
 
 
@@ -1318,6 +1449,26 @@ def send_payment_instructions(
     bot.send_message(chat_id, text + "\n\nQR оплаты пока не настроен. Напиши админу, чтобы он прислал QR вручную.", reply_markup)
 
 
+def send_plan_change_payment_instructions(
+    bot: TelegramBot,
+    config: Config,
+    chat_id: int,
+    request_id: int,
+    plan_id: str | int | None,
+    payment_method: str,
+    reply_markup: str | None = None,
+) -> None:
+    text = plan_change_payment_text(config, request_id, plan_id, payment_method)
+    qr_source = payment_qr_source(config, payment_method)
+    if qr_source:
+        try:
+            bot.send_photo(chat_id, qr_source, text, reply_markup)
+            return
+        except Exception:
+            logging.exception("Could not send plan change payment QR")
+    bot.send_message(chat_id, text + "\n\nQR оплаты пока не настроен. Напиши админу, чтобы он прислал QR вручную.", reply_markup)
+
+
 def refresh_missing_user_info(bot: TelegramBot, store: Store, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     changed = False
     seen_chat_ids: set[int] = set()
@@ -1366,6 +1517,7 @@ def handle_message(
             "/vpn_status ID - проверить заявку\n"
             "/reissue - перевыпуск ссылки\n"
             "/price - прайс лист\n"
+            "/change_plan - сменить тариф\n"
             "/subscription - срок подписки",
             reply_markup,
         )
@@ -1415,6 +1567,19 @@ def handle_message(
             chat_id,
             f"Выбери, какую ссылку перевыпустить для профиля #{existing['id']}.",
             reissue_choice_markup(int(existing["id"])),
+        )
+        return
+
+    if text.startswith("/change_plan") or text.lower() == "сменить тариф":
+        existing = store.get_active_request_by_chat_id(chat_id)
+        if not existing or existing.get("status") != "approved":
+            bot.send_message(chat_id, "У тебя пока нет активного VPN-профиля. Сначала оформи VPN через /vpn.")
+            return
+        current_plan = plan_label(existing.get("plan_id"))
+        bot.send_message(
+            chat_id,
+            f"Текущий тариф профиля #{existing['id']}: {current_plan}.\nВыбери новый тариф:",
+            plan_change_choice_markup(),
         )
         return
 
@@ -1603,6 +1768,106 @@ def handle_callback(
             bot.send_message(admin_chat_id, admin_text, admin_request_markup(request_id))
         return
 
+    if parts[0] == "changeplan" and len(parts) == 2:
+        plan_id = parts[1]
+        if plan_id not in SUBSCRIPTION_PLANS:
+            bot.answer_callback_query(callback_id, "Неизвестный тариф.")
+            return
+        existing = store.get_active_request_by_chat_id(user_chat_id)
+        if not existing or existing.get("status") != "approved":
+            bot.answer_callback_query(callback_id, "Активный профиль не найден.")
+            return
+        if str(existing.get("plan_id") or "1") == plan_id:
+            bot.answer_callback_query(callback_id, "Этот тариф уже подключен.")
+            bot.send_message(user_chat_id, f"У тебя уже подключен тариф: {plan_label(plan_id)}.")
+            return
+        bot.answer_callback_query(callback_id, "Тариф выбран.")
+        bot.send_message(
+            user_chat_id,
+            f"Новый тариф: {plan_label(plan_id)}.\nВыбери, через какой банк тебе удобнее оплатить смену тарифа:",
+            plan_change_payment_method_markup(int(existing["id"]), plan_id),
+        )
+        return
+
+    if parts[0] == "changeplanpay" and len(parts) == 4 and parts[2].isdigit():
+        payment_method = parts[1]
+        request_id = int(parts[2])
+        plan_id = parts[3]
+        if payment_method not in payment_methods(config):
+            bot.answer_callback_query(callback_id, "Этот способ оплаты не настроен.")
+            return
+        if plan_id not in SUBSCRIPTION_PLANS:
+            bot.answer_callback_query(callback_id, "Неизвестный тариф.")
+            return
+        row = store.get_request(request_id)
+        if not row or int(row.get("chat_id") or 0) != user_chat_id or row.get("status") != "approved":
+            bot.answer_callback_query(callback_id, "Активный профиль не найден.")
+            return
+        if str(row.get("plan_id") or "1") == plan_id:
+            bot.answer_callback_query(callback_id, "Этот тариф уже подключен.")
+            return
+
+        updated = store.request_plan_change(request_id, plan_id, payment_method)
+        if not updated:
+            bot.answer_callback_query(callback_id, "Профиль не найден.")
+            return
+        payment_info = payment_method_info(config, payment_method)
+        payment_method_name = payment_info["label"]
+        old_plan = plan_label(row.get("plan_id"))
+        new_plan = plan_label(plan_id)
+        bot.answer_callback_query(callback_id, "Заявка на смену тарифа создана.")
+        bot.send_message(user_chat_id, f"Заявка на смену тарифа профиля #{request_id} создана: {old_plan} -> {new_plan}.")
+        send_plan_change_payment_instructions(
+            bot,
+            config,
+            user_chat_id,
+            request_id,
+            plan_id,
+            payment_method,
+            plan_change_payment_markup(request_id, payment_info.get("link", "") or payment_info.get("qr_url", "")),
+        )
+        username, full_name = user_display(from_user)
+        admin_text = (
+            f"Заявка на смену тарифа VPN #{request_id}\n"
+            f"Старый тариф: {old_plan}\n"
+            f"Новый тариф: {new_plan}\n"
+            f"Оплата через: {payment_method_name}\n"
+            f"Сумма: {plan_info(plan_id)['price']} руб\n"
+            f"Комментарий оплаты: {payment_comment(request_id)} тариф\n"
+            "Перед одобрением вручную проверь оплату.\n"
+            f"Chat ID: {user_chat_id}\n"
+            f"Username: @{username if username else '-'}\n"
+            f"Name: {full_name or '-'}"
+        )
+        for admin_chat_id in config.admin_chat_ids:
+            bot.send_message(admin_chat_id, admin_text, admin_plan_change_markup(request_id))
+        return
+
+    if parts[0] == "planpaid" and len(parts) == 2 and parts[1].isdigit():
+        request_id = int(parts[1])
+        row = store.get_request(request_id)
+        if not row or int(row.get("chat_id") or 0) != user_chat_id:
+            bot.answer_callback_query(callback_id, "Профиль не найден.")
+            return
+        pending_plan_id = str(row.get("pending_plan_id") or "")
+        if pending_plan_id not in SUBSCRIPTION_PLANS:
+            bot.answer_callback_query(callback_id, "Нет заявки на смену тарифа.")
+            return
+        store.update_plan_change_payment_status(request_id, "user_marked_paid")
+        bot.answer_callback_query(callback_id, "Сообщил админу.")
+        bot.send_message(user_chat_id, "Спасибо. Я сообщил админу, что ты оплатил смену тарифа. Он проверит платеж и подтвердит.")
+        for admin_chat_id in config.admin_chat_ids:
+            bot.send_message(
+                admin_chat_id,
+                f"Пользователь отметил оплату смены тарифа по профилю #{request_id}.\n"
+                f"Новый тариф: {plan_label(pending_plan_id)}\n"
+                f"Сумма: {row.get('pending_plan_price') or plan_info(pending_plan_id)['price']} руб\n"
+                f"Комментарий: {payment_comment(request_id)} тариф\n"
+                "Проверь поступление вручную и нажми «Одобрить смену тарифа», если всё хорошо.",
+                admin_plan_change_markup(request_id),
+            )
+        return
+
     if parts[0] == "paid" and len(parts) == 2 and parts[1].isdigit():
         request_id = int(parts[1])
         row = store.get_request(request_id)
@@ -1651,6 +1916,42 @@ def handle_callback(
 
     if user_chat_id not in config.admin_chat_ids:
         bot.answer_callback_query(callback_id, "Нет доступа.")
+        return
+
+    if parts[0] == "approve_plan" and len(parts) == 2 and parts[1].isdigit():
+        request_id = int(parts[1])
+        row = store.get_request(request_id)
+        if not row or row.get("status") != "approved":
+            bot.answer_callback_query(callback_id, "Профиль не найден.")
+            return
+        pending_plan_id = str(row.get("pending_plan_id") or "")
+        if pending_plan_id not in SUBSCRIPTION_PLANS:
+            bot.answer_callback_query(callback_id, "Нет заявки на смену тарифа.")
+            return
+        old_plan = plan_label(row.get("plan_id"))
+        new_plan = plan_label(pending_plan_id)
+        updated = store.approve_plan_change(request_id)
+        if not updated:
+            bot.answer_callback_query(callback_id, "Не смог сменить тариф.")
+            return
+        bot.answer_callback_query(callback_id, "Тариф изменён.")
+        bot.send_message(int(updated["chat_id"]), f"Тариф VPN-профиля #{request_id} изменён: {old_plan} -> {new_plan}. Ссылка осталась прежней.")
+        bot.send_message(user_chat_id, f"Готово. Тариф профиля #{request_id} изменён: {old_plan} -> {new_plan}.")
+        return
+
+    if parts[0] == "reject_plan" and len(parts) == 2 and parts[1].isdigit():
+        request_id = int(parts[1])
+        row = store.get_request(request_id)
+        if not row or row.get("status") != "approved":
+            bot.answer_callback_query(callback_id, "Профиль не найден.")
+            return
+        updated = store.reject_plan_change(request_id)
+        if not updated:
+            bot.answer_callback_query(callback_id, "Профиль не найден.")
+            return
+        bot.answer_callback_query(callback_id, "Смена тарифа отклонена.")
+        bot.send_message(int(updated["chat_id"]), f"Админ отклонил смену тарифа профиля #{request_id}. Текущий тариф не изменился.")
+        bot.send_message(user_chat_id, f"Смена тарифа профиля #{request_id} отклонена.")
         return
 
     if parts[0] == "reject_reissue" and len(parts) == 2 and parts[1].isdigit():

@@ -143,6 +143,8 @@ User-facing tariff plans:
 
 The price list is shown after `/start` and through the `Прайс лист` button. During VPN request creation, the user selects a tariff first and then selects an operator profile.
 
+Approved users can press `Сменить тариф` or use `/change_plan` to move the existing VPN link to another device plan. The UUID/link stays the same; after manual payment verification, the admin approves the change and the bot updates only the saved device limit and plan price.
+
 After the user selects a tariff and an operator, the bot asks whether they want to pay through Sber or T-Bank. `PAYMENT_LINK` is used for Sber, `PAYMENT_TBANK_LINK` is used for T-Bank, and `PAYMENT_QR_URL` can override the Sber QR image. The message includes the exact amount and comment like `VPN #15`. The user can press `Я оплатил`; the admin manually checks the incoming payment and approves the VPN request.
 
 Admin commands:
@@ -156,6 +158,7 @@ User commands:
 ```text
 /vpn
 /reissue
+/change_plan
 /vpn_status ID
 ```
 
