@@ -7,6 +7,7 @@ import re
 import shlex
 import time
 import uuid
+from base64 import urlsafe_b64encode
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -85,6 +86,59 @@ SUBSCRIPTION_PLANS: dict[str, dict[str, int]] = {
     "4": {"devices": 4, "price": 500},
     "5": {"devices": 5, "price": 600},
 }
+
+HAPP_ROUTING_DIRECT_SITES = [
+    "geosite:private",
+    "geosite:category-gov-ru",
+    "domain:ru",
+    "domain:su",
+    "domain:рф",
+    "domain:yandex.ru",
+    "domain:yandex.net",
+    "domain:ya.ru",
+    "domain:yastatic.net",
+    "domain:yandexcloud.net",
+    "domain:sberbank.ru",
+    "domain:sber.ru",
+    "domain:online.sberbank.ru",
+    "domain:tbank.ru",
+    "domain:tinkoff.ru",
+    "domain:tinkoffbank.ru",
+    "domain:alfabank.ru",
+    "domain:vtb.ru",
+    "domain:gazprombank.ru",
+    "domain:raiffeisen.ru",
+    "domain:pochtabank.ru",
+    "domain:mkb.ru",
+    "domain:open.ru",
+    "domain:psbank.ru",
+    "domain:rsb.ru",
+    "domain:rncb.ru",
+    "domain:uralsib.ru",
+    "domain:domrfbank.ru",
+    "domain:gosuslugi.ru",
+    "domain:nalog.gov.ru",
+]
+
+HAPP_ROUTING_PROXY_SITES = [
+    "geosite:tiktok",
+    "domain:tiktok.com",
+    "domain:tiktokcdn.com",
+    "domain:tiktokv.com",
+    "domain:tiktokcdn-us.com",
+    "domain:musical.ly",
+    "domain:byteoversea.com",
+    "domain:byteoversea.net",
+    "domain:ibytedtos.com",
+    "domain:ibyteimg.com",
+    "domain:byteimg.com",
+    "domain:bytecdn.cn",
+]
+
+HAPP_ROUTING_DIRECT_IPS = [
+    "geoip:private",
+    "geoip:ru",
+]
 
 
 def is_profile_type(profile_type: str) -> bool:
@@ -176,6 +230,36 @@ def payment_text(config: Config, request_id: int, plan_id: str | int | None, pro
 
 def qr_url_for_link(link: str) -> str:
     return f"https://api.qrserver.com/v1/create-qr-code/?size=420x420&margin=12&data={quote(link, safe='')}"
+
+
+def build_happ_routing_link() -> str:
+    routing = {
+        "remarks": "VPN: TikTok через VPN, РФ напрямую",
+        "domainStrategy": "IPIfNonMatch",
+        "domainMatcher": "hybrid",
+        "GlobalProxy": True,
+        "DirectSites": HAPP_ROUTING_DIRECT_SITES,
+        "DirectIp": HAPP_ROUTING_DIRECT_IPS,
+        "ProxySites": HAPP_ROUTING_PROXY_SITES,
+        "BlockSites": [],
+        "BlockIp": [],
+        "remoteDNS": "1.1.1.1",
+        "directDNS": "https://dns.yandex.ru/dns-query",
+        "routeOrder": [
+            "blockSites",
+            "blockIp",
+            "directSites",
+            "directIp",
+            "proxySites",
+        ],
+        "domainStrategyForDirect": "UseIp",
+        "domainStrategyForProxy": "AsIs",
+        "geositeUrl": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat",
+        "geoipUrl": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat",
+    }
+    payload = json.dumps(routing, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    encoded = urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+    return f"happ://routing/onadd/{encoded}"
 
 
 def plan_change_payment_text(config: Config, request_id: int, plan_id: str | int | None, payment_method: str) -> str:
@@ -1132,7 +1216,8 @@ def admin_reply_markup() -> str:
                 [{"text": "Получить VPN"}, {"text": "Перевыпустить ссылку"}],
                 [{"text": "Сменить тариф"}, {"text": "Моя подписка"}],
                 [{"text": "Статус заявки"}],
-                [{"text": "Прайс лист"}, {"text": "Список клиентов"}],
+                [{"text": "Маршрутизация"}, {"text": "Список клиентов"}],
+                [{"text": "Прайс лист"}],
             ],
             "resize_keyboard": True,
             "is_persistent": True,
@@ -1148,6 +1233,7 @@ def user_reply_markup() -> str:
                 [{"text": "Получить VPN"}, {"text": "Прайс лист"}],
                 [{"text": "Перевыпустить ссылку"}, {"text": "Статус заявки"}],
                 [{"text": "Сменить тариф"}, {"text": "Моя подписка"}],
+                [{"text": "Маршрутизация"}],
             ],
             "resize_keyboard": True,
             "is_persistent": True,
@@ -1246,6 +1332,13 @@ def payment_markup(request_id: int, payment_url: str) -> str:
         rows.append([{"text": "Открыть QR оплаты", "url": payment_url}])
     rows.append([{"text": "Я оплатил", "callback_data": f"paid:{request_id}"}])
     return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
+
+
+def routing_markup() -> str:
+    return json.dumps(
+        {"inline_keyboard": [[{"text": "Добавить правила в Happ", "url": build_happ_routing_link()}]]},
+        ensure_ascii=False,
+    )
 
 
 def plan_change_payment_markup(request_id: int, payment_url: str) -> str:
@@ -1492,6 +1585,17 @@ def send_plan_change_payment_instructions(
     bot.send_message(chat_id, text + "\n\nQR оплаты пока не настроен. Напиши админу, чтобы он прислал QR вручную.", reply_markup)
 
 
+def send_routing_instructions(bot: TelegramBot, chat_id: int, reply_markup: str | None = None) -> None:
+    bot.send_message(
+        chat_id,
+        "Правила маршрутизации для Happ:\n\n"
+        "TikTok и его CDN будут идти через VPN.\n"
+        "Российские IP, Яндекс, госуслуги и основные российские банки будут идти напрямую, мимо VPN.\n\n"
+        "Нажми кнопку ниже в телефоне с Happ. Если приложение спросит подтверждение, выбери добавление/применение правил маршрутизации.",
+        reply_markup or routing_markup(),
+    )
+
+
 def refresh_missing_user_info(bot: TelegramBot, store: Store, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     changed = False
     seen_chat_ids: set[int] = set()
@@ -1541,9 +1645,14 @@ def handle_message(
             "/reissue - перевыпуск ссылки\n"
             "/price - прайс лист\n"
             "/change_plan - сменить тариф\n"
+            "/routing - правила TikTok/Яндекс/банки\n"
             "/subscription - срок подписки",
             reply_markup,
         )
+        return
+
+    if text.startswith("/routing") or text.lower() == "маршрутизация":
+        send_routing_instructions(bot, chat_id)
         return
 
     if text.startswith("/price") or text.lower() == "прайс лист":
@@ -2116,6 +2225,7 @@ def handle_callback(
             f"Заявка одобрена. Тариф: {selected_plan_label}. Подписка: {subscription_text}.\n\nТвоя VPN-ссылка:\n\n" + link,
             f"Готово. Заявка #{request_id} одобрена как {profile_label(profile_type)}. Тариф: {selected_plan_label}. Подписка: {subscription_text}.",
         )
+        send_routing_instructions(bot, int(row["chat_id"]))
 
 
 def check_sharing_alerts(bot: TelegramBot, store: Store, config: Config, manager: XrayManager) -> None:

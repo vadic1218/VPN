@@ -145,6 +145,8 @@ The price list is shown after `/start` and through the `Прайс лист` but
 
 Approved users can press `Сменить тариф` or use `/change_plan` to move the existing VPN link to another device plan. The UUID/link stays the same; after manual payment verification, the admin approves the change and the bot updates only the saved device limit and plan price.
 
+Users can press `Маршрутизация` or use `/routing` to add Happ routing rules: TikTok domains go through VPN, while Russian IPs, Yandex, government services, and common Russian banks go direct outside the VPN. This is client-side split tunneling, so it must be applied in the user's VPN app.
+
 After the user selects a tariff and an operator, the bot asks whether they want to pay through Sber or T-Bank. `PAYMENT_LINK` is used for Sber, `PAYMENT_TBANK_LINK` is used for T-Bank, and `PAYMENT_QR_URL` can override the Sber QR image. The message includes the exact amount and comment like `VPN #15`. The user can press `Я оплатил`; the admin manually checks the incoming payment and approves the VPN request.
 
 Admin commands:
@@ -159,6 +161,7 @@ User commands:
 /vpn
 /reissue
 /change_plan
+/routing
 /vpn_status ID
 ```
 
