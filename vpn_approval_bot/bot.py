@@ -24,6 +24,7 @@ POLL_TIMEOUT = 30
 SHARING_CHECK_INTERVAL_SECONDS = 60
 SUBSCRIPTION_CHECK_INTERVAL_SECONDS = 600
 SHARING_LOOKBACK_MINUTES = 10
+SHARING_IP_GRACE = 1
 SHARING_ALERT_COOLDOWN_MINUTES = 30
 DEFAULT_SUBSCRIPTION_DAYS = 30
 XRAY_USAGE_RE = re.compile(
@@ -1810,7 +1811,8 @@ def check_sharing_alerts(bot: TelegramBot, store: Store, config: Config, manager
     for email, ips in recent_ips.items():
         row = email_to_row[email]
         allowed_devices = int(row.get("plan_devices") or plan_info(row.get("plan_id"))["devices"])
-        if len(ips) <= allowed_devices or not store.should_send_sharing_alert(email):
+        alert_ip_limit = allowed_devices + SHARING_IP_GRACE
+        if len(ips) <= alert_ip_limit or not store.should_send_sharing_alert(email):
             continue
         request_id = int(row["id"])
         username = str(row.get("username") or "-")
