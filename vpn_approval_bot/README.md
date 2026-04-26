@@ -38,6 +38,10 @@ Admins can disable a client from the client card. Disable removes that client's 
 
 Admins can mark approved users as free clients from the client card. Free clients are shown in the `Бесплатные клиенты` admin list and are skipped by automatic subscription expiration checks.
 
+Free client cards do not show subscription extension buttons, because they are not controlled by paid subscription dates. Admins can still change the device plan for both paid and free clients directly from the client card; this updates the saved device limit without changing the VPN link.
+
+Xray config writes are serialized with a remote lock before the bot adds, reissues, or disables a profile. This prevents overlapping approvals from corrupting the config or stacking multiple Xray restarts. The current server does not expose the Xray API, so profile add/remove operations can still cause a short reconnect while Xray restarts; fully zero-drop provisioning requires enabling the Xray API in a separate migration.
+
 The bot also watches recent Xray logs for soft sharing detection. If one approved profile appears from two or more different IPs within the recent activity window, admins receive a warning with `Отключить`, `Перевыпустить`, and `Игнорировать` actions. The bot does not auto-block users from this check.
 
 ## Setup

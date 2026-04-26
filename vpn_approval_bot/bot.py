@@ -314,6 +314,14 @@ def plan_button_rows(callback_prefix: str) -> list[list[dict[str, str]]]:
     return [buttons[index : index + 1] for index in range(0, len(buttons), 1)]
 
 
+def admin_plan_button_rows(request_id: int) -> list[list[dict[str, str]]]:
+    buttons = [
+        {"text": f"Тариф {plan_label(plan_id)}", "callback_data": f"setplan:{plan_id}:{request_id}"}
+        for plan_id in sorted(SUBSCRIPTION_PLANS, key=int)
+    ]
+    return [buttons[index : index + 2] for index in range(0, len(buttons), 2)]
+
+
 def _get(raw: dict[str, Any], env_name: str, default: str = "") -> str:
     return os.getenv(env_name, str(raw.get(env_name.lower(), default))).strip()
 
@@ -781,6 +789,31 @@ class Store:
             return request
         return None
 
+    def set_plan(self, request_id: int, plan_id: str) -> dict[str, Any] | None:
+        if plan_id not in SUBSCRIPTION_PLANS:
+            return None
+        plan = plan_info(plan_id)
+        data = self._read()
+        for request in data["requests"]:
+            if int(request["id"]) != request_id:
+                continue
+            request["plan_id"] = str(plan_id)
+            request["plan_devices"] = plan["devices"]
+            request["plan_price"] = plan["price"]
+            request["plan_changed_at"] = utc_now_iso()
+            for field in (
+                "pending_plan_id",
+                "pending_plan_devices",
+                "pending_plan_price",
+                "pending_plan_payment_method",
+                "pending_plan_requested_at",
+                "pending_plan_status",
+            ):
+                request.pop(field, None)
+            self._write(data)
+            return request
+        return None
+
     def reject_plan_change(self, request_id: int) -> dict[str, Any] | None:
         data = self._read()
         for request in data["requests"]:
@@ -935,6 +968,32 @@ class XrayManager:
         err = stderr.read().decode("utf-8", "replace")
         return stdout.channel.recv_exit_status(), out, err
 
+    def _acquire_config_lock(self, client: paramiko.SSHClient, timeout_seconds: int = 90) -> None:
+        lock_dir = "/tmp/vpn-bot-xray-config.lock"
+        command = (
+            f"end=$(($(date +%s)+{int(timeout_seconds)})); "
+            f"while ! mkdir {shlex.quote(lock_dir)} 2>/dev/null; do "
+            f"if [ $(date +%s) -ge $end ]; then exit 75; fi; "
+            f"sleep 1; "
+            f"done"
+        )
+        rc, out, err = self._run(client, command)
+        if rc != 0:
+            raise RuntimeError(f"Could not lock Xray config update: {out}{err}")
+
+    def _release_config_lock(self, client: paramiko.SSHClient) -> None:
+        try:
+            self._run(client, "rmdir /tmp/vpn-bot-xray-config.lock 2>/dev/null || true")
+        except Exception:
+            try:
+                retry_client = self._connect_with_retry(attempts=2, delay=1)
+                try:
+                    self._run(retry_client, "rmdir /tmp/vpn-bot-xray-config.lock 2>/dev/null || true")
+                finally:
+                    retry_client.close()
+            except Exception:
+                logging.warning("Could not release Xray config lock", exc_info=True)
+
     def _connect_with_retry(self, attempts: int = 6, delay: int = 3) -> paramiko.SSHClient:
         last_error: Exception | None = None
         for _ in range(attempts):
@@ -997,10 +1056,14 @@ class XrayManager:
 
     def save_client(self, client_email: str, client_uuid: str) -> None:
         client = self._connect()
-        sftp = client.open_sftp()
+        sftp = None
+        lock_acquired = False
         stamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
         backup_path = f"{self.config.backup_dir}/config.json.backup-vpn-bot-{stamp}"
         try:
+            self._acquire_config_lock(client)
+            lock_acquired = True
+            sftp = client.open_sftp()
             with sftp.open(self.config.xray_config_path, "r") as fh:
                 xray_config = json.load(fh)
 
@@ -1053,14 +1116,20 @@ class XrayManager:
         finally:
             if sftp is not None:
                 sftp.close()
+            if lock_acquired:
+                self._release_config_lock(client)
             client.close()
 
     def remove_client(self, client_email: str) -> None:
         client = self._connect()
-        sftp = client.open_sftp()
+        sftp = None
+        lock_acquired = False
         stamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
         backup_path = f"{self.config.backup_dir}/config.json.backup-vpn-disable-{stamp}"
         try:
+            self._acquire_config_lock(client)
+            lock_acquired = True
+            sftp = client.open_sftp()
             with sftp.open(self.config.xray_config_path, "r") as fh:
                 xray_config = json.load(fh)
 
@@ -1112,6 +1181,8 @@ class XrayManager:
         finally:
             if sftp is not None:
                 sftp.close()
+            if lock_acquired:
+                self._release_config_lock(client)
             client.close()
 
     def list_bot_clients(self) -> list[dict[str, str]]:
@@ -1394,13 +1465,16 @@ def admin_reissue_request_markup(request_id: int, profile_type: str) -> str:
 
 def admin_client_markup(row: dict[str, Any]) -> str:
     request_id = int(row["id"])
-    rows = [
-        [
-            {"text": "+7 дней", "callback_data": f"extend:7:{request_id}"},
-            {"text": "+30 дней", "callback_data": f"extend:30:{request_id}"},
-            {"text": "+90 дней", "callback_data": f"extend:90:{request_id}"},
-        ]
-    ]
+    rows = []
+    if not row.get("is_free"):
+        rows.append(
+            [
+                {"text": "+7 дней", "callback_data": f"extend:7:{request_id}"},
+                {"text": "+30 дней", "callback_data": f"extend:30:{request_id}"},
+                {"text": "+90 дней", "callback_data": f"extend:90:{request_id}"},
+            ]
+        )
+    rows.extend(admin_plan_button_rows(request_id))
     rows.extend(profile_button_rows("reissue", request_id))
     if row.get("is_free"):
         rows.append([{"text": "Убрать бесплатный доступ", "callback_data": f"free:off:{request_id}"}])
@@ -2130,6 +2204,35 @@ def handle_callback(
 
     if user_chat_id not in config.admin_chat_ids:
         bot.answer_callback_query(callback_id, "Нет доступа.")
+        return
+
+    if parts[0] == "setplan" and len(parts) == 3 and parts[2].isdigit():
+        plan_id = parts[1]
+        request_id = int(parts[2])
+        if plan_id not in SUBSCRIPTION_PLANS:
+            bot.answer_callback_query(callback_id, "Неизвестный тариф.")
+            return
+        row = store.get_request(request_id)
+        if not row or row.get("status") != "approved":
+            bot.answer_callback_query(callback_id, "Профиль не найден.")
+            return
+        old_plan = plan_label(row.get("plan_id"))
+        new_plan = plan_label(plan_id)
+        if str(row.get("plan_id") or "1") == plan_id:
+            bot.answer_callback_query(callback_id, "Этот тариф уже подключен.")
+            return
+        updated = store.set_plan(request_id, plan_id)
+        if not updated:
+            bot.answer_callback_query(callback_id, "Не смог сменить тариф.")
+            return
+        bot.answer_callback_query(callback_id, "Тариф изменён.")
+        send_admin_result(
+            bot,
+            user_chat_id,
+            int(updated["chat_id"]),
+            f"Тариф VPN-профиля #{request_id} изменён админом: {old_plan} -> {new_plan}. Ссылка осталась прежней.",
+            f"Готово. Тариф профиля #{request_id} изменён: {old_plan} -> {new_plan}.",
+        )
         return
 
     if parts[0] == "approve_plan" and len(parts) == 2 and parts[1].isdigit():
