@@ -786,6 +786,9 @@ class TelegramBot:
             payload["reply_markup"] = reply_markup
         self._request("sendPhoto", payload)
 
+    def delete_message(self, chat_id: int, message_id: int) -> None:
+        self._request("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
+
     def get_chat(self, chat_id: int) -> dict[str, Any]:
         return self._request("getChat", {"chat_id": chat_id}).get("result", {})
 
@@ -1428,6 +1431,27 @@ def chat_user_display(chat: dict[str, Any]) -> tuple[str, str]:
     return username, full_name
 
 
+def delete_callback_message(bot: TelegramBot, callback_query: dict[str, Any]) -> None:
+    message = callback_query.get("message") or {}
+    chat = message.get("chat") or {}
+    chat_id = int(chat.get("id") or 0)
+    message_id = int(message.get("message_id") or 0)
+    if not chat_id or not message_id:
+        return
+    try:
+        bot.delete_message(chat_id, message_id)
+    except Exception:
+        logging.info("Could not delete callback message chat_id=%s message_id=%s", chat_id, message_id)
+
+
+def send_admin_result(bot: TelegramBot, admin_chat_id: int, user_chat_id: int, user_text: str, admin_text: str) -> None:
+    if admin_chat_id == user_chat_id:
+        bot.send_message(admin_chat_id, user_text)
+        return
+    bot.send_message(user_chat_id, user_text)
+    bot.send_message(admin_chat_id, admin_text)
+
+
 def send_payment_instructions(
     bot: TelegramBot,
     config: Config,
@@ -1672,6 +1696,7 @@ def handle_callback(
     parts = payload.split(":")
     if not parts:
         return
+    delete_callback_message(bot, callback_query)
 
     if parts[0] == "plan" and len(parts) == 2:
         plan_id = parts[1]
@@ -1737,7 +1762,6 @@ def handle_callback(
         selected_profile_label = profile_label(profile_type)
         selected_plan_label = plan_label(plan_id)
         bot.answer_callback_query(callback_id, "Заявка отправлена.")
-        bot.send_message(user_chat_id, f"Заявка #{request_id} создана. Тип: {selected_profile_label}. Тариф: {selected_plan_label}.")
         store.update_payment_status(request_id, "waiting_manual_payment")
         payment_method_name = payment_method_info(config, payment_method)["label"]
         payment_info = payment_method_info(config, payment_method)
@@ -1816,7 +1840,6 @@ def handle_callback(
         old_plan = plan_label(row.get("plan_id"))
         new_plan = plan_label(plan_id)
         bot.answer_callback_query(callback_id, "Заявка на смену тарифа создана.")
-        bot.send_message(user_chat_id, f"Заявка на смену тарифа профиля #{request_id} создана: {old_plan} -> {new_plan}.")
         send_plan_change_payment_instructions(
             bot,
             config,
@@ -1855,17 +1878,6 @@ def handle_callback(
             return
         store.update_plan_change_payment_status(request_id, "user_marked_paid")
         bot.answer_callback_query(callback_id, "Сообщил админу.")
-        bot.send_message(user_chat_id, "Спасибо. Я сообщил админу, что ты оплатил смену тарифа. Он проверит платеж и подтвердит.")
-        for admin_chat_id in config.admin_chat_ids:
-            bot.send_message(
-                admin_chat_id,
-                f"Пользователь отметил оплату смены тарифа по профилю #{request_id}.\n"
-                f"Новый тариф: {plan_label(pending_plan_id)}\n"
-                f"Сумма: {row.get('pending_plan_price') or plan_info(pending_plan_id)['price']} руб\n"
-                f"Комментарий: {payment_comment(request_id)} тариф\n"
-                "Проверь поступление вручную и нажми «Одобрить смену тарифа», если всё хорошо.",
-                admin_plan_change_markup(request_id),
-            )
         return
 
     if parts[0] == "paid" and len(parts) == 2 and parts[1].isdigit():
@@ -1876,16 +1888,6 @@ def handle_callback(
             return
         store.update_payment_status(request_id, "user_marked_paid")
         bot.answer_callback_query(callback_id, "Сообщил админу.")
-        bot.send_message(user_chat_id, "Спасибо. Я сообщил админу, что ты оплатил. Он проверит платеж и одобрит VPN.")
-        for admin_chat_id in config.admin_chat_ids:
-            bot.send_message(
-                admin_chat_id,
-                f"Пользователь отметил оплату по заявке #{request_id}.\n"
-                f"Сумма: {row.get('plan_price') or plan_info(row.get('plan_id'))['price']} руб\n"
-                f"Комментарий: {payment_comment(request_id)}\n"
-                "Проверь поступление вручную и нажми «Одобрить», если все хорошо.",
-                admin_request_markup(request_id),
-            )
         return
 
     if parts[0] == "reissue_request" and len(parts) == 3 and parts[2].isdigit():
@@ -1935,8 +1937,13 @@ def handle_callback(
             bot.answer_callback_query(callback_id, "Не смог сменить тариф.")
             return
         bot.answer_callback_query(callback_id, "Тариф изменён.")
-        bot.send_message(int(updated["chat_id"]), f"Тариф VPN-профиля #{request_id} изменён: {old_plan} -> {new_plan}. Ссылка осталась прежней.")
-        bot.send_message(user_chat_id, f"Готово. Тариф профиля #{request_id} изменён: {old_plan} -> {new_plan}.")
+        send_admin_result(
+            bot,
+            user_chat_id,
+            int(updated["chat_id"]),
+            f"Тариф VPN-профиля #{request_id} изменён: {old_plan} -> {new_plan}. Ссылка осталась прежней.",
+            f"Готово. Тариф профиля #{request_id} изменён: {old_plan} -> {new_plan}.",
+        )
         return
 
     if parts[0] == "reject_plan" and len(parts) == 2 and parts[1].isdigit():
@@ -1950,8 +1957,13 @@ def handle_callback(
             bot.answer_callback_query(callback_id, "Профиль не найден.")
             return
         bot.answer_callback_query(callback_id, "Смена тарифа отклонена.")
-        bot.send_message(int(updated["chat_id"]), f"Админ отклонил смену тарифа профиля #{request_id}. Текущий тариф не изменился.")
-        bot.send_message(user_chat_id, f"Смена тарифа профиля #{request_id} отклонена.")
+        send_admin_result(
+            bot,
+            user_chat_id,
+            int(updated["chat_id"]),
+            f"Админ отклонил смену тарифа профиля #{request_id}. Текущий тариф не изменился.",
+            f"Смена тарифа профиля #{request_id} отклонена.",
+        )
         return
 
     if parts[0] == "reject_reissue" and len(parts) == 2 and parts[1].isdigit():
@@ -2098,8 +2110,13 @@ def handle_callback(
         label = f"VPN {request_id} {profile_short(profile_type)}"
         link = build_vless_link(config, client_uuid, profile_type, label)
         subscription_text = format_subscription(subscription_until(config.default_subscription_days))
-        bot.send_message(int(row["chat_id"]), f"Заявка одобрена. Тариф: {selected_plan_label}. Подписка: {subscription_text}.\n\nТвоя VPN-ссылка:\n\n" + link)
-        bot.send_message(user_chat_id, f"Готово. Заявка #{request_id} одобрена как {profile_label(profile_type)}. Тариф: {selected_plan_label}. Подписка: {subscription_text}.")
+        send_admin_result(
+            bot,
+            user_chat_id,
+            int(row["chat_id"]),
+            f"Заявка одобрена. Тариф: {selected_plan_label}. Подписка: {subscription_text}.\n\nТвоя VPN-ссылка:\n\n" + link,
+            f"Готово. Заявка #{request_id} одобрена как {profile_label(profile_type)}. Тариф: {selected_plan_label}. Подписка: {subscription_text}.",
+        )
 
 
 def check_sharing_alerts(bot: TelegramBot, store: Store, config: Config, manager: XrayManager) -> None:
