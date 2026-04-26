@@ -32,6 +32,8 @@ Old profiles with `default` and `mts` remain valid.
 
 Admins get a persistent `Список клиентов` button. It shows approved profiles, selected operator profile, creation time, and how long ago each client was last seen in Xray logs.
 
+When an admin requests `Список клиентов` or `Бесплатные клиенты` again, the bot deletes the previous client-list messages it sent in that chat before sending the fresh list.
+
 Admins can also reissue a client link into any operator profile. Reissue replaces the old UUID and resets the server-side first-IP binding for that profile.
 
 Admins can disable a client from the client card. Disable removes that client's UUID from Xray, so the old VPN link stops working completely and not just from a specific IP.
@@ -151,7 +153,7 @@ The price list is shown after `/start` and through the `Прайс лист` but
 
 Approved users can press `Сменить тариф` or use `/change_plan` to move the existing VPN link to another device plan. The UUID/link stays the same; after manual payment verification, the admin approves the change and the bot updates only the saved device limit and plan price.
 
-Users can open `Моя подписка` to see their current status, price list, and action buttons for reissue, plan changes, and Happ routing. The routing action sends a raw `happ://routing/onadd/...` link because Telegram may not open custom Happ links from inline URL buttons on every device. TikTok domains go through VPN, while Russian IPs, Yandex, government services, and common Russian banks go direct outside the VPN. This is client-side split tunneling, so it must be applied in the user's VPN app.
+Users can open `Моя подписка` to see their current status, price list, and action buttons for reissue, plan changes, and Happ routing. The routing action sends a Happ-compatible QR code plus a raw `happ://routing/onadd/...` link for manual copy. TikTok domains go through VPN, while Russian IPs, Yandex, government services, and common Russian banks go direct outside the VPN. This is client-side split tunneling, so it must be applied in the user's VPN app.
 
 After the user selects a tariff and an operator, the bot asks whether they want to pay through Sber or T-Bank. `PAYMENT_LINK` is used for Sber, `PAYMENT_TBANK_LINK` is used for T-Bank, and `PAYMENT_QR_URL` can override the Sber QR image. The message includes the exact amount and comment like `VPN #15`. The user can press `Я оплатил`; the admin manually checks the incoming payment and approves the VPN request.
 

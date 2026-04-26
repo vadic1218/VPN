@@ -7,7 +7,7 @@ import re
 import shlex
 import time
 import uuid
-from base64 import urlsafe_b64encode
+from base64 import b64encode
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -234,31 +234,32 @@ def qr_url_for_link(link: str) -> str:
 
 def build_happ_routing_link() -> str:
     routing = {
-        "remarks": "VPN: TikTok через VPN, РФ напрямую",
-        "domainStrategy": "IPIfNonMatch",
-        "domainMatcher": "hybrid",
-        "GlobalProxy": True,
+        "Name": "VPN: TikTok через VPN, РФ напрямую",
+        "GlobalProxy": "true",
+        "RemoteDNSType": "DoH",
+        "RemoteDNSDomain": "https://cloudflare-dns.com/dns-query",
+        "RemoteDNSIP": "1.1.1.1",
+        "DomesticDNSType": "DoH",
+        "DomesticDNSDomain": "https://dns.yandex.ru/dns-query",
+        "DomesticDNSIP": "77.88.8.8",
+        "Geoipurl": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat",
+        "Geositeurl": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat",
+        "LastUpdated": str(int(time.time())),
+        "DnsHosts": {
+            "cloudflare-dns.com": "1.1.1.1",
+            "dns.yandex.ru": "77.88.8.8",
+        },
         "DirectSites": HAPP_ROUTING_DIRECT_SITES,
         "DirectIp": HAPP_ROUTING_DIRECT_IPS,
         "ProxySites": HAPP_ROUTING_PROXY_SITES,
+        "ProxyIp": [],
         "BlockSites": [],
         "BlockIp": [],
-        "remoteDNS": "1.1.1.1",
-        "directDNS": "https://dns.yandex.ru/dns-query",
-        "routeOrder": [
-            "blockSites",
-            "blockIp",
-            "directSites",
-            "directIp",
-            "proxySites",
-        ],
-        "domainStrategyForDirect": "UseIp",
-        "domainStrategyForProxy": "AsIs",
-        "geositeUrl": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat",
-        "geoipUrl": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat",
+        "DomainStrategy": "IPIfNonMatch",
+        "FakeDNS": "false",
     }
     payload = json.dumps(routing, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    encoded = urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+    encoded = b64encode(payload).decode("ascii")
     return f"happ://routing/onadd/{encoded}"
 
 
@@ -435,6 +436,26 @@ class Store:
 
     def replace_data(self, data: dict[str, Any]) -> None:
         self._write(self._normalize_data(data))
+
+    def pop_admin_list_message_ids(self, chat_id: int) -> list[int]:
+        data = self._read()
+        lists = data.setdefault("admin_list_messages", {})
+        raw_ids = lists.pop(str(chat_id), []) if isinstance(lists, dict) else []
+        self._write(data)
+        result: list[int] = []
+        for item in raw_ids:
+            if str(item).isdigit():
+                result.append(int(item))
+        return result
+
+    def set_admin_list_message_ids(self, chat_id: int, message_ids: list[int]) -> None:
+        data = self._read()
+        lists = data.setdefault("admin_list_messages", {})
+        if not isinstance(lists, dict):
+            lists = {}
+            data["admin_list_messages"] = lists
+        lists[str(chat_id)] = [int(message_id) for message_id in message_ids if int(message_id) > 0]
+        self._write(data)
 
     def merge_remote_data(self, remote_data: dict[str, Any]) -> int:
         if not remote_data:
@@ -913,17 +934,17 @@ class TelegramBot:
             payload["offset"] = offset
         return self._request("getUpdates", payload).get("result", [])
 
-    def send_message(self, chat_id: int, text: str, reply_markup: str | None = None) -> None:
+    def send_message(self, chat_id: int, text: str, reply_markup: str | None = None) -> dict[str, Any]:
         payload = {"chat_id": chat_id, "text": text}
         if reply_markup:
             payload["reply_markup"] = reply_markup
-        self._request("sendMessage", payload)
+        return self._request("sendMessage", payload).get("result", {})
 
-    def send_photo(self, chat_id: int, photo: str, caption: str, reply_markup: str | None = None) -> None:
+    def send_photo(self, chat_id: int, photo: str, caption: str, reply_markup: str | None = None) -> dict[str, Any]:
         payload = {"chat_id": chat_id, "photo": photo, "caption": caption}
         if reply_markup:
             payload["reply_markup"] = reply_markup
-        self._request("sendPhoto", payload)
+        return self._request("sendPhoto", payload).get("result", {})
 
     def delete_message(self, chat_id: int, message_id: int) -> None:
         self._request("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
@@ -1645,6 +1666,24 @@ def delete_callback_message(bot: TelegramBot, callback_query: dict[str, Any]) ->
         logging.info("Could not delete callback message chat_id=%s message_id=%s", chat_id, message_id)
 
 
+def message_id_from_result(result: dict[str, Any]) -> int:
+    message_id = result.get("message_id") if isinstance(result, dict) else 0
+    return int(message_id or 0) if str(message_id or "").isdigit() else 0
+
+
+def clear_previous_admin_list_messages(bot: TelegramBot, store: Store, chat_id: int) -> None:
+    for message_id in store.pop_admin_list_message_ids(chat_id):
+        try:
+            bot.delete_message(chat_id, message_id)
+        except Exception:
+            logging.info("Could not delete previous admin list message chat_id=%s message_id=%s", chat_id, message_id)
+
+
+def remember_admin_list_messages(store: Store, chat_id: int, sent_messages: list[dict[str, Any]]) -> None:
+    message_ids = [message_id_from_result(item) for item in sent_messages]
+    store.set_admin_list_message_ids(chat_id, [message_id for message_id in message_ids if message_id])
+
+
 def send_admin_result(bot: TelegramBot, admin_chat_id: int, user_chat_id: int, user_text: str, admin_text: str) -> None:
     if admin_chat_id == user_chat_id:
         bot.send_message(admin_chat_id, user_text)
@@ -1696,12 +1735,21 @@ def send_plan_change_payment_instructions(
 
 def send_routing_instructions(bot: TelegramBot, chat_id: int, reply_markup: str | None = None) -> None:
     routing_link = build_happ_routing_link()
-    bot.send_message(
-        chat_id,
+    intro = (
         "Правила маршрутизации для Happ:\n\n"
         "TikTok и его CDN будут идти через VPN.\n"
         "Российские IP, Яндекс, госуслуги и основные российские банки будут идти напрямую, мимо VPN.\n\n"
-        "Если Telegram не открывает ссылку автоматически, скопируй всю строку ниже и открой её на телефоне с Happ:\n\n"
+        "Открой QR-код через Happ или скопируй ссылку из следующего сообщения."
+    )
+    qr_source = qr_url_for_link(routing_link)
+    try:
+        bot.send_photo(chat_id, qr_source, intro)
+    except Exception:
+        logging.exception("Could not send Happ routing QR")
+        bot.send_message(chat_id, intro)
+    bot.send_message(
+        chat_id,
+        "Ссылка маршрутизации Happ:\n\n"
         f"{routing_link}",
         reply_markup,
     )
@@ -1769,6 +1817,7 @@ def handle_message(
         if chat_id not in config.admin_chat_ids:
             bot.send_message(chat_id, "Эта команда доступна только админу.")
             return
+        clear_previous_admin_list_messages(bot, store, chat_id)
         rows = store.list_approved_requests()
         if not rows:
             try:
@@ -1786,20 +1835,24 @@ def handle_message(
             error_text = str(exc)
             if len(error_text) > 500:
                 error_text = error_text[:500] + "..."
-            bot.send_message(chat_id, f"Не смог получить активность с сервера: {error_text}", admin_reply_markup())
+            sent = bot.send_message(chat_id, f"Не смог получить активность с сервера: {error_text}", admin_reply_markup())
+            remember_admin_list_messages(store, chat_id, [sent])
             return
         if not rows:
-            bot.send_message(chat_id, format_client_list(rows, last_seen), admin_reply_markup())
+            sent = bot.send_message(chat_id, format_client_list(rows, last_seen), admin_reply_markup())
+            remember_admin_list_messages(store, chat_id, [sent])
             return
-        bot.send_message(chat_id, format_client_list(rows, last_seen), admin_reply_markup())
+        sent_messages = [bot.send_message(chat_id, format_client_list(rows, last_seen), admin_reply_markup())]
         for number, row in enumerate(rows, start=1):
-            bot.send_message(chat_id, format_client_card(row, last_seen, number), admin_client_markup(row))
+            sent_messages.append(bot.send_message(chat_id, format_client_card(row, last_seen, number), admin_client_markup(row)))
+        remember_admin_list_messages(store, chat_id, sent_messages)
         return
 
     if text.startswith("/free_clients") or text.lower() == "бесплатные клиенты":
         if chat_id not in config.admin_chat_ids:
             bot.send_message(chat_id, "Эта команда доступна только админу.")
             return
+        clear_previous_admin_list_messages(bot, store, chat_id)
         rows = refresh_missing_user_info(bot, store, store.list_free_requests())
         try:
             last_seen = manager.get_last_seen_by_email([str(row["client_email"]) for row in rows])
@@ -1807,11 +1860,13 @@ def handle_message(
             logging.exception("Failed to load free client activity")
             last_seen = {}
         if not rows:
-            bot.send_message(chat_id, "Бесплатных клиентов пока нет. Добавить можно из карточки клиента в «Список клиентов».", admin_reply_markup())
+            sent = bot.send_message(chat_id, "Бесплатных клиентов пока нет. Добавить можно из карточки клиента в «Список клиентов».", admin_reply_markup())
+            remember_admin_list_messages(store, chat_id, [sent])
             return
-        bot.send_message(chat_id, "Бесплатные клиенты:", admin_reply_markup())
+        sent_messages = [bot.send_message(chat_id, "Бесплатные клиенты:", admin_reply_markup())]
         for number, row in enumerate(rows, start=1):
-            bot.send_message(chat_id, format_client_card(row, last_seen, number), admin_client_markup(row))
+            sent_messages.append(bot.send_message(chat_id, format_client_card(row, last_seen, number), admin_client_markup(row)))
+        remember_admin_list_messages(store, chat_id, sent_messages)
         return
 
     if text.startswith("/reissue") or text.lower() == "перевыпустить ссылку":
