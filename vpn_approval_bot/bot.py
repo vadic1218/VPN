@@ -555,6 +555,9 @@ class Store:
                 latest_by_chat_id[int(request["chat_id"])] = request
         return sorted(latest_by_chat_id.values(), key=lambda item: int(item["id"]))
 
+    def list_free_requests(self) -> list[dict[str, Any]]:
+        return [request for request in self.list_approved_requests() if request.get("is_free")]
+
     def import_approved_clients(self, clients: list[dict[str, str]]) -> int:
         data = self._read()
         existing_emails = {str(item.get("client_email") or "") for item in data["requests"]}
@@ -668,6 +671,23 @@ class Store:
                 request["disabled_at"] = now
                 self._write(data)
                 return
+
+    def set_free_access(self, request_id: int, is_free: bool) -> dict[str, Any] | None:
+        data = self._read()
+        for request in data["requests"]:
+            if int(request["id"]) != request_id:
+                continue
+            request["is_free"] = bool(is_free)
+            request["free_access_updated_at"] = utc_now_iso()
+            if is_free:
+                request["subscription_status"] = "free"
+                if not request.get("subscription_until"):
+                    request["subscription_until"] = subscription_until(DEFAULT_SUBSCRIPTION_DAYS)
+            elif request.get("subscription_status") == "free":
+                request["subscription_status"] = "active"
+            self._write(data)
+            return request
+        return None
 
     def update_payment_status(self, request_id: int, payment_status: str) -> dict[str, Any] | None:
         data = self._read()
@@ -783,6 +803,8 @@ class Store:
         now = datetime.now(timezone.utc)
         result: list[dict[str, Any]] = []
         for request in self.list_approved_requests():
+            if request.get("is_free"):
+                continue
             until = parse_iso_time(str(request.get("subscription_until") or ""))
             if not until:
                 continue
@@ -1213,11 +1235,8 @@ def admin_reply_markup() -> str:
     return json.dumps(
         {
             "keyboard": [
-                [{"text": "Получить VPN"}, {"text": "Перевыпустить ссылку"}],
-                [{"text": "Сменить тариф"}, {"text": "Моя подписка"}],
-                [{"text": "Статус заявки"}],
-                [{"text": "Маршрутизация"}, {"text": "Список клиентов"}],
-                [{"text": "Прайс лист"}],
+                [{"text": "Получить VPN"}, {"text": "Моя подписка"}],
+                [{"text": "Список клиентов"}, {"text": "Бесплатные клиенты"}],
             ],
             "resize_keyboard": True,
             "is_persistent": True,
@@ -1230,10 +1249,7 @@ def user_reply_markup() -> str:
     return json.dumps(
         {
             "keyboard": [
-                [{"text": "Получить VPN"}, {"text": "Прайс лист"}],
-                [{"text": "Перевыпустить ссылку"}, {"text": "Статус заявки"}],
-                [{"text": "Сменить тариф"}, {"text": "Моя подписка"}],
-                [{"text": "Маршрутизация"}],
+                [{"text": "Получить VPN"}, {"text": "Моя подписка"}],
             ],
             "resize_keyboard": True,
             "is_persistent": True,
@@ -1334,19 +1350,25 @@ def payment_markup(request_id: int, payment_url: str) -> str:
     return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
 
 
-def routing_markup() -> str:
-    return json.dumps(
-        {"inline_keyboard": [[{"text": "Добавить правила в Happ", "url": build_happ_routing_link()}]]},
-        ensure_ascii=False,
-    )
-
-
 def plan_change_payment_markup(request_id: int, payment_url: str) -> str:
     rows = []
     if payment_url:
         rows.append([{"text": "Открыть QR оплаты", "url": payment_url}])
     rows.append([{"text": "Я оплатил смену тарифа", "callback_data": f"planpaid:{request_id}"}])
     return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
+
+
+def subscription_actions_markup(request_id: int) -> str:
+    return json.dumps(
+        {
+            "inline_keyboard": [
+                [{"text": "Перевыпустить ссылку", "callback_data": f"show_reissue:{request_id}"}],
+                [{"text": "Сменить тариф", "callback_data": "show_change_plan"}],
+                [{"text": "Маршрутизация Happ", "callback_data": "send_routing"}],
+            ]
+        },
+        ensure_ascii=False,
+    )
 
 
 def reissue_choice_markup(request_id: int) -> str:
@@ -1370,7 +1392,8 @@ def admin_reissue_request_markup(request_id: int, profile_type: str) -> str:
     )
 
 
-def admin_client_markup(request_id: int) -> str:
+def admin_client_markup(row: dict[str, Any]) -> str:
+    request_id = int(row["id"])
     rows = [
         [
             {"text": "+7 дней", "callback_data": f"extend:7:{request_id}"},
@@ -1379,6 +1402,10 @@ def admin_client_markup(request_id: int) -> str:
         ]
     ]
     rows.extend(profile_button_rows("reissue", request_id))
+    if row.get("is_free"):
+        rows.append([{"text": "Убрать бесплатный доступ", "callback_data": f"free:off:{request_id}"}])
+    else:
+        rows.append([{"text": "Сделать бесплатным", "callback_data": f"free:on:{request_id}"}])
     rows.append([{"text": "Отключить пользователя", "callback_data": f"disable:{request_id}"}])
     return json.dumps(
         {"inline_keyboard": rows},
@@ -1450,6 +1477,12 @@ def format_subscription(value: str | None) -> str:
     return f"до {date_text}, осталось {days} дн"
 
 
+def subscription_display(row: dict[str, Any]) -> str:
+    if row.get("is_free"):
+        return "бесплатный доступ, без автоотключения"
+    return format_subscription(str(row.get("subscription_until") or ""))
+
+
 def format_client_list(rows: list[dict[str, Any]], last_seen: dict[str, str]) -> str:
     if not rows:
         return "Одобренных клиентов пока нет."
@@ -1459,7 +1492,7 @@ def format_client_list(rows: list[dict[str, Any]], last_seen: dict[str, str]) ->
         profile_type = profile_label(str(row.get("profile_type") or "default"))
         email = str(row.get("client_email") or "")
         username = format_username(str(row.get("username") or ""))
-        subscription = format_subscription(str(row.get("subscription_until") or ""))
+        subscription = subscription_display(row)
         plan = plan_label(row.get("plan_id"))
         lines.append(
             f"{number}. {username} | {profile_type} | тариф: {plan} | подписка: {subscription} | активность: {format_age(last_seen.get(email))}"
@@ -1478,13 +1511,15 @@ def format_client_card(row: dict[str, Any], last_seen: dict[str, str], number: i
     created_at = str(row.get("created_at") or "-")
     decided_at = str(row.get("decided_at") or "-")
     subscription_status = str(row.get("subscription_status") or "active")
-    subscription_text = format_subscription(str(row.get("subscription_until") or ""))
+    subscription_text = subscription_display(row)
+    free_text = "да" if row.get("is_free") else "нет"
     plan = plan_label(row.get("plan_id"))
     restored = "да" if row.get("restored_from_xray") else "нет"
     return (
         f"Клиент #{number}\n"
         f"Статус: {status}\n"
         f"Подписка: {subscription_status}, {subscription_text}\n"
+        f"Бесплатный доступ: {free_text}\n"
         f"Тариф: {plan}\n"
         f"Chat ID: {chat_id}\n"
         f"Username: {username}\n"
@@ -1586,13 +1621,15 @@ def send_plan_change_payment_instructions(
 
 
 def send_routing_instructions(bot: TelegramBot, chat_id: int, reply_markup: str | None = None) -> None:
+    routing_link = build_happ_routing_link()
     bot.send_message(
         chat_id,
         "Правила маршрутизации для Happ:\n\n"
         "TikTok и его CDN будут идти через VPN.\n"
         "Российские IP, Яндекс, госуслуги и основные российские банки будут идти напрямую, мимо VPN.\n\n"
-        "Нажми кнопку ниже в телефоне с Happ. Если приложение спросит подтверждение, выбери добавление/применение правил маршрутизации.",
-        reply_markup or routing_markup(),
+        "Если Telegram не открывает ссылку автоматически, скопируй всю строку ниже и открой её на телефоне с Happ:\n\n"
+        f"{routing_link}",
+        reply_markup,
     )
 
 
@@ -1643,7 +1680,6 @@ def handle_message(
             "/vpn - выбрать оператора и отправить заявку на VPN\n"
             "/vpn_status ID - проверить заявку\n"
             "/reissue - перевыпуск ссылки\n"
-            "/price - прайс лист\n"
             "/change_plan - сменить тариф\n"
             "/routing - правила TikTok/Яндекс/банки\n"
             "/subscription - срок подписки",
@@ -1653,10 +1689,6 @@ def handle_message(
 
     if text.startswith("/routing") or text.lower() == "маршрутизация":
         send_routing_instructions(bot, chat_id)
-        return
-
-    if text.startswith("/price") or text.lower() == "прайс лист":
-        bot.send_message(chat_id, price_list_text(), user_reply_markup() if chat_id not in config.admin_chat_ids else admin_reply_markup())
         return
 
     if text.startswith("/clients") or text.lower() == "список клиентов":
@@ -1687,7 +1719,25 @@ def handle_message(
             return
         bot.send_message(chat_id, format_client_list(rows, last_seen), admin_reply_markup())
         for number, row in enumerate(rows, start=1):
-            bot.send_message(chat_id, format_client_card(row, last_seen, number), admin_client_markup(int(row["id"])))
+            bot.send_message(chat_id, format_client_card(row, last_seen, number), admin_client_markup(row))
+        return
+
+    if text.startswith("/free_clients") or text.lower() == "бесплатные клиенты":
+        if chat_id not in config.admin_chat_ids:
+            bot.send_message(chat_id, "Эта команда доступна только админу.")
+            return
+        rows = refresh_missing_user_info(bot, store, store.list_free_requests())
+        try:
+            last_seen = manager.get_last_seen_by_email([str(row["client_email"]) for row in rows])
+        except Exception:
+            logging.exception("Failed to load free client activity")
+            last_seen = {}
+        if not rows:
+            bot.send_message(chat_id, "Бесплатных клиентов пока нет. Добавить можно из карточки клиента в «Список клиентов».", admin_reply_markup())
+            return
+        bot.send_message(chat_id, "Бесплатные клиенты:", admin_reply_markup())
+        for number, row in enumerate(rows, start=1):
+            bot.send_message(chat_id, format_client_card(row, last_seen, number), admin_client_markup(row))
         return
 
     if text.startswith("/reissue") or text.lower() == "перевыпустить ссылку":
@@ -1718,15 +1768,37 @@ def handle_message(
     if text.startswith("/subscription") or text.lower() == "моя подписка":
         existing = store.get_active_request_by_chat_id(chat_id)
         if not existing or existing.get("status") != "approved":
-            bot.send_message(chat_id, "У тебя пока нет активной VPN-подписки.")
+            bot.send_message(
+                chat_id,
+                "У тебя пока нет активной VPN-подписки.\n\n" + price_list_text(),
+                user_reply_markup() if chat_id not in config.admin_chat_ids else admin_reply_markup(),
+            )
             return
         bot.send_message(
             chat_id,
-            f"Твоя VPN-подписка: {format_subscription(str(existing.get('subscription_until') or ''))}.\n"
+            f"Твоя VPN-подписка: {subscription_display(existing)}.\n"
             f"Профиль: #{existing['id']}, {profile_label(str(existing.get('profile_type') or 'default'))}.\n"
-            f"Тариф: {plan_label(existing.get('plan_id'))}.",
-            user_reply_markup(),
+            f"Тариф: {plan_label(existing.get('plan_id'))}.\n"
+            f"Статус заявки: {existing['status']}.\n\n"
+            f"{price_list_text()}",
+            subscription_actions_markup(int(existing["id"])),
         )
+        return
+
+    if text.startswith("/price") or text.lower() == "прайс лист":
+        existing = store.get_active_request_by_chat_id(chat_id)
+        if existing and existing.get("status") == "approved":
+            bot.send_message(
+                chat_id,
+                f"Твоя VPN-подписка: {subscription_display(existing)}.\n"
+                f"Профиль: #{existing['id']}, {profile_label(str(existing.get('profile_type') or 'default'))}.\n"
+                f"Тариф: {plan_label(existing.get('plan_id'))}.\n"
+                f"Статус заявки: {existing['status']}.\n\n"
+                f"{price_list_text()}",
+                subscription_actions_markup(int(existing["id"])),
+            )
+            return
+        bot.send_message(chat_id, price_list_text(), user_reply_markup() if chat_id not in config.admin_chat_ids else admin_reply_markup())
         return
 
     if text.lower() == "статус заявки":
@@ -1737,7 +1809,7 @@ def handle_message(
         bot.send_message(
             chat_id,
             f"Статус заявки #{existing['id']}: {existing['status']}\n"
-            f"Подписка: {format_subscription(str(existing.get('subscription_until') or ''))}\n"
+            f"Подписка: {subscription_display(existing)}\n"
             f"Тариф: {plan_label(existing.get('plan_id'))}",
             user_reply_markup(),
         )
@@ -1755,7 +1827,7 @@ def handle_message(
         bot.send_message(
             chat_id,
             f"Статус заявки #{row['id']}: {row['status']}\n"
-            f"Подписка: {format_subscription(str(row.get('subscription_until') or ''))}\n"
+            f"Подписка: {subscription_display(row)}\n"
             f"Тариф: {plan_label(row.get('plan_id'))}",
         )
         return
@@ -1834,6 +1906,38 @@ def handle_callback(
             user_chat_id,
             "Выбери, через какой банк тебе удобнее оплатить:",
             payment_method_markup(plan_id, profile_type),
+        )
+        return
+
+    if parts[0] == "send_routing":
+        bot.answer_callback_query(callback_id, "Отправляю правила.")
+        send_routing_instructions(bot, user_chat_id)
+        return
+
+    if parts[0] == "show_change_plan":
+        existing = store.get_active_request_by_chat_id(user_chat_id)
+        if not existing or existing.get("status") != "approved":
+            bot.answer_callback_query(callback_id, "Активный профиль не найден.")
+            return
+        bot.answer_callback_query(callback_id, "Выбери тариф.")
+        bot.send_message(
+            user_chat_id,
+            f"Текущий тариф профиля #{existing['id']}: {plan_label(existing.get('plan_id'))}.\nВыбери новый тариф:",
+            plan_change_choice_markup(),
+        )
+        return
+
+    if parts[0] == "show_reissue" and len(parts) == 2 and parts[1].isdigit():
+        request_id = int(parts[1])
+        row = store.get_request(request_id)
+        if not row or int(row.get("chat_id") or 0) != user_chat_id or row.get("status") != "approved":
+            bot.answer_callback_query(callback_id, "Активный профиль не найден.")
+            return
+        bot.answer_callback_query(callback_id, "Выбери тип ссылки.")
+        bot.send_message(
+            user_chat_id,
+            f"Выбери, какую ссылку перевыпустить для профиля #{request_id}.",
+            reissue_choice_markup(request_id),
         )
         return
 
@@ -2072,6 +2176,25 @@ def handle_callback(
             f"Админ отклонил смену тарифа профиля #{request_id}. Текущий тариф не изменился.",
             f"Смена тарифа профиля #{request_id} отклонена.",
         )
+        return
+
+    if parts[0] == "free" and len(parts) == 3 and parts[2].isdigit():
+        is_free = parts[1] == "on"
+        request_id = int(parts[2])
+        row = store.get_request(request_id)
+        if not row or row.get("status") != "approved":
+            bot.answer_callback_query(callback_id, "Профиль не найден.")
+            return
+        updated = store.set_free_access(request_id, is_free)
+        if not updated:
+            bot.answer_callback_query(callback_id, "Профиль не найден.")
+            return
+        if is_free:
+            bot.answer_callback_query(callback_id, "Добавлен в бесплатные.")
+            bot.send_message(user_chat_id, f"Профиль #{request_id} добавлен в бесплатные клиенты. Автоотключение по подписке не сработает.")
+        else:
+            bot.answer_callback_query(callback_id, "Убран из бесплатных.")
+            bot.send_message(user_chat_id, f"Профиль #{request_id} убран из бесплатных клиентов.")
         return
 
     if parts[0] == "reject_reissue" and len(parts) == 2 and parts[1].isdigit():
