@@ -1369,7 +1369,7 @@ def format_client_list(rows: list[dict[str, Any]], last_seen: dict[str, str]) ->
         subscription = format_subscription(str(row.get("subscription_until") or ""))
         plan = plan_label(row.get("plan_id"))
         lines.append(
-            f"{number}. {username} | ID профиля: {row['id']} | {profile_type} | тариф: {plan} | подписка: {subscription} | активность: {format_age(last_seen.get(email))}"
+            f"{number}. {username} | {profile_type} | тариф: {plan} | подписка: {subscription} | активность: {format_age(last_seen.get(email))}"
         )
     return "\n".join(lines)
 
@@ -1390,7 +1390,6 @@ def format_client_card(row: dict[str, Any], last_seen: dict[str, str], number: i
     restored = "да" if row.get("restored_from_xray") else "нет"
     return (
         f"Клиент #{number}\n"
-        f"ID профиля: {row['id']}\n"
         f"Статус: {status}\n"
         f"Подписка: {subscription_status}, {subscription_text}\n"
         f"Тариф: {plan}\n"
