@@ -1800,28 +1800,25 @@ def send_plan_change_payment_instructions(
 
 def send_routing_instructions(bot: TelegramBot, chat_id: int, reply_markup: str | None = None) -> None:
     routing_link = build_happ_routing_link()
-    intro = (
+    text = (
         "Правила маршрутизации для Happ:\n\n"
         "TikTok и его CDN будут идти через VPN.\n"
-        "Российские IP, Яндекс, госуслуги и основные российские банки будут идти напрямую, мимо VPN.\n\n"
-        "Открой QR-код через Happ или скопируй ссылку из следующего сообщения."
+        "Российские сервисы, банки, VK, Госуслуги, Яндекс и капчи будут идти напрямую, мимо VPN.\n\n"
+        "Нажми кнопку ниже, чтобы добавить правила в Happ."
     )
-    qr_source = qr_url_for_link(routing_link)
-    try:
-        bot.send_photo(chat_id, qr_source, intro)
-    except Exception:
-        logging.exception("Could not send Happ routing QR")
-        bot.send_message(chat_id, intro)
-    text = "Ссылка маршрутизации Happ:\n\n" f"{routing_link}"
     try:
         bot.send_message(chat_id, text, routing_open_markup(routing_link))
     except Exception:
         logging.exception("Could not send Happ routing open button")
         try:
-            bot.send_message(chat_id, text, routing_copy_markup(routing_link))
+            bot.send_message(
+                chat_id,
+                text + "\n\nTelegram не разрешил открыть Happ напрямую. Нажми кнопку ниже, она скопирует ссылку.",
+                routing_copy_markup(routing_link),
+            )
         except Exception:
             logging.exception("Could not send Happ routing copy button")
-            bot.send_message(chat_id, text, reply_markup)
+            bot.send_message(chat_id, "Не смог отправить кнопку маршрутизации Happ. Попробуй позже.", reply_markup)
 
 
 def refresh_missing_user_info(bot: TelegramBot, store: Store, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
