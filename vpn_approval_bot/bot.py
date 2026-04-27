@@ -1499,13 +1499,6 @@ def plan_change_payment_markup(request_id: int, payment_url: str) -> str:
 
 def routing_open_markup(routing_link: str) -> str:
     return json.dumps(
-        {"inline_keyboard": [[{"text": "Открыть в Happ", "url": routing_link}]]},
-        ensure_ascii=False,
-    )
-
-
-def routing_copy_markup(routing_link: str) -> str:
-    return json.dumps(
         {
             "inline_keyboard": [
                 [{"text": "Скопировать ссылку Happ", "copy_text": {"text": routing_link}}],
@@ -1800,25 +1793,22 @@ def send_plan_change_payment_instructions(
 
 def send_routing_instructions(bot: TelegramBot, chat_id: int, reply_markup: str | None = None) -> None:
     routing_link = build_happ_routing_link()
-    text = (
+    caption = (
         "Правила маршрутизации для Happ:\n\n"
         "TikTok и его CDN будут идти через VPN.\n"
         "Российские сервисы, банки, VK, Госуслуги, Яндекс и капчи будут идти напрямую, мимо VPN.\n\n"
-        "Нажми кнопку ниже, чтобы добавить правила в Happ."
+        "Отсканируй QR через Happ или нажми кнопку ниже, чтобы скопировать ссылку."
     )
+    qr_source = qr_url_for_link(routing_link)
     try:
-        bot.send_message(chat_id, text, routing_open_markup(routing_link))
+        bot.send_photo(chat_id, qr_source, caption, routing_open_markup(routing_link))
     except Exception:
-        logging.exception("Could not send Happ routing open button")
-        try:
-            bot.send_message(
-                chat_id,
-                text + "\n\nTelegram не разрешил открыть Happ напрямую. Нажми кнопку ниже, она скопирует ссылку.",
-                routing_copy_markup(routing_link),
-            )
-        except Exception:
-            logging.exception("Could not send Happ routing copy button")
-            bot.send_message(chat_id, "Не смог отправить кнопку маршрутизации Happ. Попробуй позже.", reply_markup)
+        logging.exception("Could not send Happ routing QR")
+        bot.send_message(
+            chat_id,
+            "Не смог отправить QR-код маршрутизации Happ. Нажми кнопку ниже, чтобы скопировать ссылку.",
+            routing_open_markup(routing_link),
+        )
 
 
 def refresh_missing_user_info(bot: TelegramBot, store: Store, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
