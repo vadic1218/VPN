@@ -28,12 +28,15 @@ CONFIG_PATH = BASE_DIR / "config.json"
 POLL_TIMEOUT = 30
 SHARING_CHECK_INTERVAL_SECONDS = 60
 SUBSCRIPTION_CHECK_INTERVAL_SECONDS = 600
+INACTIVE_CHECK_INTERVAL_SECONDS = 86400
 SHARING_LOOKBACK_MINUTES = 10
 SHARING_IP_GRACE = 1
 SHARING_ALERT_COOLDOWN_MINUTES = 30
 DEFAULT_SUBSCRIPTION_DAYS = 30
 SUBSCRIPTION_NOTICE_DAYS = (3, 1)
 INACTIVE_CLEANUP_DAYS = 60
+LAST_SEEN_JOURNAL_LINES = 1500
+USAGE_STATS_JOURNAL_LINES = 5000
 XRAY_USAGE_RE = re.compile(
     r"from (?:tcp:)?(?P<ip>\d+\.\d+\.\d+\.\d+):\d+ accepted .* email: (?P<email>\S+)"
 )
@@ -686,6 +689,9 @@ class Store:
             if request.get("status") == "approved" and request.get("client_email"):
                 latest_by_chat_id[int(request["chat_id"])] = request
         return sorted(latest_by_chat_id.values(), key=lambda item: int(item["id"]))
+
+    def list_paid_requests(self) -> list[dict[str, Any]]:
+        return [request for request in self.list_approved_requests() if not request.get("is_free")]
 
     def list_free_requests(self) -> list[dict[str, Any]]:
         return [request for request in self.list_approved_requests() if request.get("is_free")]
@@ -1500,7 +1506,7 @@ fi
             return {}
         client = self._connect()
         try:
-            command = "journalctl -u xray -n 5000 -o short-iso --no-pager || true"
+            command = f"journalctl -u xray -n {LAST_SEEN_JOURNAL_LINES} -o short-iso --no-pager || true"
             rc, out, err = self._run(client, command)
             if rc != 0:
                 raise RuntimeError((err or "Could not read Xray journal").strip()[:500])
@@ -1510,11 +1516,15 @@ fi
         last_seen: dict[str, str] = {}
         email_set = set(emails)
         for line in out.splitlines():
-            for email in email_set:
-                if f"email: {email}" in line:
-                    parts = line.split(maxsplit=1)
-                    if parts:
-                        last_seen[email] = parts[0]
+            match = XRAY_USAGE_RE.search(line)
+            if not match:
+                continue
+            email = match.group("email")
+            if email not in email_set:
+                continue
+            parts = line.split(maxsplit=1)
+            if parts:
+                last_seen[email] = parts[0]
         return last_seen
 
     def get_recent_ips_by_email(self, emails: list[str], minutes: int = SHARING_LOOKBACK_MINUTES) -> dict[str, set[str]]:
@@ -1540,7 +1550,7 @@ fi
                 result[email].add(match.group("ip"))
         return result
 
-    def get_usage_stats(self, client_email: str, lines: int = 20000) -> dict[str, Any]:
+    def get_usage_stats(self, client_email: str, lines: int = USAGE_STATS_JOURNAL_LINES) -> dict[str, Any]:
         client = self._connect()
         try:
             command = f"journalctl -u xray -n {int(lines)} -o short-iso --no-pager || true"
@@ -1896,9 +1906,9 @@ def subscription_display(row: dict[str, Any]) -> str:
 
 def format_client_list(rows: list[dict[str, Any]], last_seen: dict[str, str]) -> str:
     if not rows:
-        return "Одобренных клиентов пока нет."
+        return "Платных клиентов пока нет. Бесплатные клиенты вынесены в отдельный раздел."
 
-    lines = [f"Клиенты VPN: {len(rows)}"]
+    lines = [f"Платные клиенты VPN: {len(rows)}"]
     for number, row in enumerate(rows, start=1):
         profile_type = profile_label(str(row.get("profile_type") or "default"))
         email = str(row.get("client_email") or "")
@@ -2229,12 +2239,14 @@ def handle_message(
             bot.send_message(chat_id, "Эта команда доступна только админу.")
             return
         clear_previous_admin_list_messages(bot, store, chat_id)
-        rows = store.list_approved_requests()
+        rows = store.list_paid_requests()
         if not rows:
             try:
-                imported = store.import_approved_clients(manager.list_bot_clients())
+                imported = 0
+                if not store.list_approved_requests():
+                    imported = store.import_approved_clients(manager.list_bot_clients())
                 if imported:
-                    rows = store.list_approved_requests()
+                    rows = store.list_paid_requests()
                     bot.send_message(chat_id, f"Восстановил клиентов из Xray: {imported}.")
             except Exception:
                 logging.exception("Failed to restore clients from Xray")
@@ -3122,16 +3134,23 @@ def main() -> None:
     offset = None
     last_sharing_check = 0.0
     last_subscription_check = 0.0
+    last_inactive_check = 0.0
     while True:
         try:
             now = time.monotonic()
             if now - last_subscription_check >= SUBSCRIPTION_CHECK_INTERVAL_SECONDS:
                 try:
                     check_expired_subscriptions(bot, store, config, manager)
-                    check_inactive_clients(bot, store, config, manager)
                 except Exception:
                     logging.exception("Subscription expiration check failed")
                 last_subscription_check = now
+
+            if now - last_inactive_check >= INACTIVE_CHECK_INTERVAL_SECONDS:
+                try:
+                    check_inactive_clients(bot, store, config, manager)
+                except Exception:
+                    logging.exception("Inactive client check failed")
+                last_inactive_check = now
 
             if now - last_sharing_check >= SHARING_CHECK_INTERVAL_SECONDS:
                 try:

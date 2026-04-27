@@ -30,7 +30,7 @@ Old profiles with `default` and `mts` remain valid.
 
 ## Admin Features
 
-Admins get a persistent `Список клиентов` button. It shows approved profiles, selected operator profile, creation time, and how long ago each client was last seen in Xray logs.
+Admins get a persistent `Список клиентов` button. It shows paid approved profiles, selected operator profile, creation time, and how long ago each client was last seen in Xray logs. Free users are intentionally excluded from this list and shown only in `Бесплатные клиенты`.
 
 When an admin requests `Список клиентов` or `Бесплатные клиенты` again, the bot deletes the previous client-list messages it sent in that chat before sending the fresh list.
 
@@ -51,6 +51,8 @@ Xray config writes are serialized with a remote lock before the bot adds, reissu
 The bot also watches recent Xray logs for soft sharing detection. If one approved profile appears from two or more different IPs within the recent activity window, admins receive a warning with `Отключить`, `Перевыпустить`, and `Игнорировать` actions. The bot does not auto-block users from this check.
 
 The subscription checker also sends reminders before expiration, currently at 3 days and 1 day before the deadline. Admins can set an exact subscription date with `/extend_until ID YYYY-MM-DD`. The bot monitors inactive paid clients and notifies admins if a profile has not appeared in recent activity for the configured inactivity window; it does not auto-delete those profiles without admin confirmation.
+
+Performance notes: the bot keeps heavy VPS log reads limited. Client-list activity uses a bounded journal read, sharing checks read only the recent window, detailed statistics are loaded only when an admin opens a client's `Статистика`, and inactive-client checks run once per day instead of every subscription cycle.
 
 ## Setup
 
