@@ -89,15 +89,57 @@ SUBSCRIPTION_PLANS: dict[str, dict[str, int]] = {
 
 HAPP_ROUTING_DIRECT_SITES = [
     "geosite:private",
+    "geosite:category-ru",
     "geosite:category-gov-ru",
     "domain:ru",
     "domain:su",
     "domain:рф",
+    "domain:vk.com",
+    "domain:vk.ru",
+    "domain:vkuseraudio.net",
+    "domain:vkuserlive.net",
+    "domain:vkuser.net",
+    "domain:vkvideo.ru",
+    "domain:userapi.com",
+    "domain:mycdn.me",
+    "domain:ok.ru",
+    "domain:mail.ru",
+    "domain:imgsmail.ru",
+    "domain:my.mail.ru",
+    "domain:cloud.mail.ru",
     "domain:yandex.ru",
     "domain:yandex.net",
     "domain:ya.ru",
     "domain:yastatic.net",
     "domain:yandexcloud.net",
+    "domain:dzen.ru",
+    "domain:kinopoisk.ru",
+    "domain:rutube.ru",
+    "domain:premier.one",
+    "domain:ivi.ru",
+    "domain:okko.tv",
+    "domain:more.tv",
+    "domain:smotrim.ru",
+    "domain:avito.ru",
+    "domain:ozon.ru",
+    "domain:wildberries.ru",
+    "domain:wb.ru",
+    "domain:lamoda.ru",
+    "domain:2gis.ru",
+    "domain:2gis.com",
+    "domain:hh.ru",
+    "domain:rabota.ru",
+    "domain:kp.ru",
+    "domain:rbc.ru",
+    "domain:lenta.ru",
+    "domain:ria.ru",
+    "domain:tass.ru",
+    "domain:fontanka.ru",
+    "domain:mos.ru",
+    "domain:mosreg.ru",
+    "domain:pfr.gov.ru",
+    "domain:sfr.gov.ru",
+    "domain:esia.gosuslugi.ru",
     "domain:sberbank.ru",
     "domain:sber.ru",
     "domain:online.sberbank.ru",
@@ -118,6 +160,12 @@ HAPP_ROUTING_DIRECT_SITES = [
     "domain:domrfbank.ru",
     "domain:gosuslugi.ru",
     "domain:nalog.gov.ru",
+    "domain:google.com",
+    "domain:www.google.com",
+    "domain:gstatic.com",
+    "domain:googleusercontent.com",
+    "domain:recaptcha.net",
+    "domain:hcaptcha.com",
 ]
 
 HAPP_ROUTING_PROXY_SITES = [
@@ -593,7 +641,6 @@ class Store:
         existing_ids = {int(item["id"]) for item in data["requests"] if str(item.get("id") or "").isdigit()}
         imported = 0
         now = utc_now_iso()
-        initial_subscription_until = subscription_until(DEFAULT_SUBSCRIPTION_DAYS)
 
         for client in clients:
             email = str(client.get("email") or "")
@@ -621,8 +668,8 @@ class Store:
                     "uuid": client_uuid,
                     "created_at": now,
                     "decided_at": now,
-                    "subscription_status": "active",
-                    "subscription_until": initial_subscription_until,
+                    "subscription_status": "restored_no_deadline",
+                    "subscription_until": "",
                     "restored_from_xray": True,
                 }
             )
@@ -1450,6 +1497,24 @@ def plan_change_payment_markup(request_id: int, payment_url: str) -> str:
     return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
 
 
+def routing_open_markup(routing_link: str) -> str:
+    return json.dumps(
+        {"inline_keyboard": [[{"text": "Открыть в Happ", "url": routing_link}]]},
+        ensure_ascii=False,
+    )
+
+
+def routing_copy_markup(routing_link: str) -> str:
+    return json.dumps(
+        {
+            "inline_keyboard": [
+                [{"text": "Скопировать ссылку Happ", "copy_text": {"text": routing_link}}],
+            ]
+        },
+        ensure_ascii=False,
+    )
+
+
 def subscription_actions_markup(request_id: int) -> str:
     return json.dumps(
         {
@@ -1747,12 +1812,16 @@ def send_routing_instructions(bot: TelegramBot, chat_id: int, reply_markup: str 
     except Exception:
         logging.exception("Could not send Happ routing QR")
         bot.send_message(chat_id, intro)
-    bot.send_message(
-        chat_id,
-        "Ссылка маршрутизации Happ:\n\n"
-        f"{routing_link}",
-        reply_markup,
-    )
+    text = "Ссылка маршрутизации Happ:\n\n" f"{routing_link}"
+    try:
+        bot.send_message(chat_id, text, routing_open_markup(routing_link))
+    except Exception:
+        logging.exception("Could not send Happ routing open button")
+        try:
+            bot.send_message(chat_id, text, routing_copy_markup(routing_link))
+        except Exception:
+            logging.exception("Could not send Happ routing copy button")
+            bot.send_message(chat_id, text, reply_markup)
 
 
 def refresh_missing_user_info(bot: TelegramBot, store: Store, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

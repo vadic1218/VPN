@@ -153,7 +153,9 @@ The price list is shown after `/start` and through the `Прайс лист` but
 
 Approved users can press `Сменить тариф` or use `/change_plan` to move the existing VPN link to another device plan. The UUID/link stays the same; after manual payment verification, the admin approves the change and the bot updates only the saved device limit and plan price.
 
-Users can open `Моя подписка` to see their current status, price list, and action buttons for reissue, plan changes, and Happ routing. The routing action sends a Happ-compatible QR code plus a raw `happ://routing/onadd/...` link for manual copy. TikTok domains go through VPN, while Russian IPs, Yandex, government services, and common Russian banks go direct outside the VPN. This is client-side split tunneling, so it must be applied in the user's VPN app.
+Users can open `Моя подписка` to see their current status, price list, and action buttons for reissue, plan changes, and Happ routing. The routing action sends a Happ-compatible QR code, an open/copy button, and a raw `happ://routing/onadd/...` link for manual fallback. TikTok domains go through VPN, while Russian IPs, VK, Yandex, Gosuslugi, Russian media, marketplaces, job sites, common Russian banks, and browser captcha services go direct outside the VPN. This is client-side split tunneling, so it must be applied in the user's VPN app.
+
+If the bot has to restore approved VPN profiles directly from the Xray config after a redeploy or database loss, it no longer grants a new 30-day subscription automatically. Restored profiles are marked with an unknown deadline until the saved bot database/remote state is available or an admin sets the subscription manually.
 
 After the user selects a tariff and an operator, the bot asks whether they want to pay through Sber or T-Bank. `PAYMENT_LINK` is used for Sber, `PAYMENT_TBANK_LINK` is used for T-Bank, and `PAYMENT_QR_URL` can override the Sber QR image. The message includes the exact amount and comment like `VPN #15`. The user can press `Я оплатил`; the admin manually checks the incoming payment and approves the VPN request.
 
