@@ -106,6 +106,7 @@ PAYMENT_LINK
 PAYMENT_TBANK_LINK
 PAYMENT_RECIPIENT
 PAYMENT_BANKS
+PUBLIC_BASE_URL
 ```
 
 Recommended Railway values:
@@ -127,6 +128,7 @@ PAYMENT_TBANK_LINK=https://www.tinkoff.ru/rm/r_fpDGcUCZRx.uCrfsYPegf/WuswZ21804
 PAYMENT_QR_URL=
 PAYMENT_RECIPIENT=Вадим
 PAYMENT_BANKS=Сбер / Т-Банк
+PUBLIC_BASE_URL=https://your-railway-domain.up.railway.app
 ```
 
 If you use `DB_PATH=/data/vpn_approval.json`, attach a Railway volume mounted at `/data` so requests and clients survive restarts.
@@ -153,7 +155,7 @@ The price list is shown after `/start` and through the `Прайс лист` but
 
 Approved users can press `Сменить тариф` or use `/change_plan` to move the existing VPN link to another device plan. The UUID/link stays the same; after manual payment verification, the admin approves the change and the bot updates only the saved device limit and plan price.
 
-Users can open `Моя подписка` to see their current status, price list, and action buttons for reissue, plan changes, and Happ routing. The routing action sends one QR-code message with a copy button under it, without printing the full `happ://routing/onadd/...` link in chat. TikTok domains go through VPN, while Russian IPs, VK, Yandex, Gosuslugi, Russian media, marketplaces, job sites, common Russian banks, and browser captcha services go direct outside the VPN. This is client-side split tunneling, so it must be applied in the user's VPN app.
+Users can open `Моя подписка` to see their current status, price list, and action buttons for reissue, plan changes, and Happ routing. The routing action sends one QR-code message with an `Открыть в Happ` button under it. The button points to the bot's `/happ-routing` HTTPS endpoint and that endpoint immediately redirects to the generated `happ://routing/onadd/...` link, because Telegram inline URL buttons do not reliably accept custom app schemes directly. TikTok domains go through VPN, while Russian IPs, VK, Yandex, Gosuslugi, Russian media, marketplaces, job sites, common Russian banks, and browser captcha services go direct outside the VPN. This is client-side split tunneling, so it must be applied in the user's VPN app.
 
 If the bot has to restore approved VPN profiles directly from the Xray config after a redeploy or database loss, it no longer grants a new 30-day subscription automatically. Restored profiles are marked with an unknown deadline until the saved bot database/remote state is available or an admin sets the subscription manually.
 

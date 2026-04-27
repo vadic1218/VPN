@@ -5,11 +5,14 @@ import logging
 import os
 import re
 import shlex
+import threading
 import time
 import uuid
 from base64 import b64encode
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from html import escape
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -65,6 +68,8 @@ class Config:
     payment_recipient: str
     payment_banks: str
     remote_state_path: str
+    public_base_url: str
+    web_port: int
 
 
 OPERATOR_PROFILES: dict[str, dict[str, str]] = {
@@ -311,6 +316,12 @@ def build_happ_routing_link() -> str:
     return f"happ://routing/onadd/{encoded}"
 
 
+def happ_routing_redirect_url(config: Config) -> str:
+    if not config.public_base_url:
+        return ""
+    return f"{config.public_base_url}/happ-routing"
+
+
 def plan_change_payment_text(config: Config, request_id: int, plan_id: str | int | None, payment_method: str) -> str:
     plan = plan_info(plan_id)
     method = payment_method_info(config, payment_method)
@@ -407,6 +418,8 @@ def load_config() -> Config:
     db_path_raw = _get(raw, "DB_PATH", str(default_db_path()))
     db_path = Path(db_path_raw)
     db_path.parent.mkdir(parents=True, exist_ok=True)
+    railway_public_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip()
+    default_public_base_url = f"https://{railway_public_domain}" if railway_public_domain else ""
 
     return Config(
         telegram_token=token,
@@ -432,6 +445,8 @@ def load_config() -> Config:
         remote_state_path=_get(raw, "REMOTE_STATE_PATH", "/usr/local/etc/xray/vpn_approval_state.json"),
         payment_recipient=_get(raw, "PAYMENT_RECIPIENT", "Вадим"),
         payment_banks=_get(raw, "PAYMENT_BANKS", "Сбер / Т-Банк"),
+        public_base_url=_get(raw, "PUBLIC_BASE_URL", default_public_base_url).rstrip("/"),
+        web_port=int(_get(raw, "PORT", "0") or "0"),
     )
 
 
@@ -1009,6 +1024,53 @@ class TelegramBot:
             logging.warning("Could not answer callback query", exc_info=True)
 
 
+def start_routing_web_server(config: Config) -> None:
+    if config.web_port <= 0:
+        return
+
+    class RoutingHandler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: Any) -> None:
+            logging.info("HTTP %s", format % args)
+
+        def _send_text(self, status: int, body: str, content_type: str = "text/plain; charset=utf-8") -> None:
+            payload = body.encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_GET(self) -> None:
+            path = self.path.split("?", 1)[0]
+            if path in {"/", "/healthz"}:
+                self._send_text(200, "ok\n")
+                return
+            if path != "/happ-routing":
+                self._send_text(404, "not found\n")
+                return
+
+            routing_link = build_happ_routing_link()
+            safe_link = escape(routing_link, quote=True)
+            body = (
+                "<!doctype html><html><head>"
+                '<meta charset="utf-8">'
+                '<meta name="viewport" content="width=device-width, initial-scale=1">'
+                '<meta http-equiv="refresh" content="0;url=' + safe_link + '">'
+                "<title>Open Happ</title>"
+                "<script>location.replace(" + json.dumps(routing_link) + ");</script>"
+                "</head><body>"
+                '<p>Открываю Happ...</p>'
+                '<p><a href="' + safe_link + '">Нажми здесь, если Happ не открылся автоматически</a></p>'
+                "</body></html>"
+            )
+            self._send_text(200, body, "text/html; charset=utf-8")
+
+    server = HTTPServer(("0.0.0.0", config.web_port), RoutingHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logging.info("Routing web server started on port %s", config.web_port)
+
+
 class XrayManager:
     def __init__(self, config: Config) -> None:
         self.config = config
@@ -1497,11 +1559,11 @@ def plan_change_payment_markup(request_id: int, payment_url: str) -> str:
     return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
 
 
-def routing_open_markup(routing_link: str) -> str:
+def routing_open_markup(open_url: str) -> str:
     return json.dumps(
         {
             "inline_keyboard": [
-                [{"text": "Скопировать ссылку Happ", "copy_text": {"text": routing_link}}],
+                [{"text": "Открыть в Happ", "url": open_url}],
             ]
         },
         ensure_ascii=False,
@@ -1791,23 +1853,32 @@ def send_plan_change_payment_instructions(
     bot.send_message(chat_id, text + "\n\nQR оплаты пока не настроен. Напиши админу, чтобы он прислал QR вручную.", reply_markup)
 
 
-def send_routing_instructions(bot: TelegramBot, chat_id: int, reply_markup: str | None = None) -> None:
+def send_routing_instructions(bot: TelegramBot, config: Config, chat_id: int, reply_markup: str | None = None) -> None:
     routing_link = build_happ_routing_link()
+    open_url = happ_routing_redirect_url(config)
     caption = (
         "Правила маршрутизации для Happ:\n\n"
         "TikTok и его CDN будут идти через VPN.\n"
         "Российские сервисы, банки, VK, Госуслуги, Яндекс и капчи будут идти напрямую, мимо VPN.\n\n"
-        "Отсканируй QR через Happ или нажми кнопку ниже, чтобы скопировать ссылку."
+        "Отсканируй QR через Happ или нажми кнопку ниже, чтобы открыть Happ."
     )
     qr_source = qr_url_for_link(routing_link)
+    if not open_url:
+        bot.send_photo(chat_id, qr_source, caption, reply_markup)
+        bot.send_message(
+            chat_id,
+            "Кнопка открытия Happ будет доступна после настройки PUBLIC_BASE_URL на Railway.",
+            reply_markup,
+        )
+        return
     try:
-        bot.send_photo(chat_id, qr_source, caption, routing_open_markup(routing_link))
+        bot.send_photo(chat_id, qr_source, caption, routing_open_markup(open_url))
     except Exception:
         logging.exception("Could not send Happ routing QR")
         bot.send_message(
             chat_id,
-            "Не смог отправить QR-код маршрутизации Happ. Нажми кнопку ниже, чтобы скопировать ссылку.",
-            routing_open_markup(routing_link),
+            "Не смог отправить QR-код маршрутизации Happ. Нажми кнопку ниже, чтобы открыть Happ.",
+            routing_open_markup(open_url),
         )
 
 
@@ -1866,7 +1937,7 @@ def handle_message(
         return
 
     if text.startswith("/routing") or text.lower() == "маршрутизация":
-        send_routing_instructions(bot, chat_id)
+        send_routing_instructions(bot, config, chat_id)
         return
 
     if text.startswith("/clients") or text.lower() == "список клиентов":
@@ -2096,7 +2167,7 @@ def handle_callback(
 
     if parts[0] == "send_routing":
         bot.answer_callback_query(callback_id, "Отправляю правила.")
-        send_routing_instructions(bot, user_chat_id)
+        send_routing_instructions(bot, config, user_chat_id)
         return
 
     if parts[0] == "show_change_plan":
@@ -2562,7 +2633,7 @@ def handle_callback(
             f"Заявка одобрена. Тариф: {selected_plan_label}. Подписка: {subscription_text}.\n\nТвоя VPN-ссылка:\n\n" + link,
             f"Готово. Заявка #{request_id} одобрена как {profile_label(profile_type)}. Тариф: {selected_plan_label}. Подписка: {subscription_text}.",
         )
-        send_routing_instructions(bot, int(row["chat_id"]))
+        send_routing_instructions(bot, config, int(row["chat_id"]))
 
 
 def check_sharing_alerts(bot: TelegramBot, store: Store, config: Config, manager: XrayManager) -> None:
@@ -2620,6 +2691,7 @@ def check_expired_subscriptions(bot: TelegramBot, store: Store, config: Config, 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     config = load_config()
+    start_routing_web_server(config)
     store = Store(config.db_path)
     bot = TelegramBot(config.telegram_token)
     manager = XrayManager(config)
