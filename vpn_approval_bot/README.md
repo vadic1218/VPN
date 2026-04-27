@@ -44,7 +44,9 @@ Free client cards do not show subscription extension buttons, because they are n
 
 Client cards use compact action menus. The main card shows only high-level sections: subscription extension, tariff, operator/reissue, statistics, reserve link, and access controls. Each section opens its own inline submenu so the chat is not filled with every possible action at once.
 
-Admins can run `/check_vpn` or press `Проверить VPN` to see Xray status, profile-guard status, listening ports, uptime, and whether `RESERVE_VPN_HOST` is configured. If `RESERVE_VPN_HOST` is set, the client card can generate a reserve VLESS link for the same UUID using that host.
+Admins can run `/check_vpn`, press `Проверить VPN`, or press `Ресурсы сервера` to see a Russian grouped server summary: VPN services, uptime, CPU, load average, RAM, disk usage, active VPN TCP connections, open VPN ports, and whether `RESERVE_VPN_HOST` is configured. If `RESERVE_VPN_HOST` is set, the client card can generate a reserve VLESS link for the same UUID using that host.
+
+Client cards have a `Статистика` section. It shows grouped per-profile activity in Telegram: recent connection count, share of total VPN activity, active profiles in the log sample, unique IP count, first seen time, and last seen time. Xray does not expose exact CPU/RAM per user in this setup, so per-user resource usage is represented by real profile activity from Xray logs.
 
 Xray config writes are serialized with a remote lock before the bot adds, reissues, or disables a profile. This prevents overlapping approvals from corrupting the config or stacking multiple Xray restarts. The current server does not expose the Xray API, so profile add/remove operations can still cause a short reconnect while Xray restarts; fully zero-drop provisioning requires enabling the Xray API in a separate migration.
 

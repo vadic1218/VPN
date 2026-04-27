@@ -1550,7 +1550,12 @@ fi
                 result[email].add(match.group("ip"))
         return result
 
-    def get_usage_stats(self, client_email: str, lines: int = USAGE_STATS_JOURNAL_LINES) -> dict[str, Any]:
+    def get_usage_stats(
+        self,
+        client_email: str,
+        all_client_emails: list[str] | None = None,
+        lines: int = USAGE_STATS_JOURNAL_LINES,
+    ) -> dict[str, Any]:
         client = self._connect()
         try:
             command = f"journalctl -u xray -n {int(lines)} -o short-iso --no-pager || true"
@@ -1560,22 +1565,43 @@ fi
         finally:
             client.close()
 
+        tracked_emails = set(all_client_emails or [])
         hits = 0
+        total_tracked_hits = 0
+        active_tracked_emails: set[str] = set()
         ips: set[str] = set()
         first_seen = ""
         last_seen = ""
         for line in out.splitlines():
-            if f"email: {client_email}" not in line:
+            match = XRAY_USAGE_RE.search(line)
+            if not match:
+                continue
+            email = match.group("email")
+            if tracked_emails and email in tracked_emails:
+                total_tracked_hits += 1
+                active_tracked_emails.add(email)
+            if email != client_email:
                 continue
             hits += 1
             parts = line.split(maxsplit=1)
             if parts:
                 first_seen = first_seen or parts[0]
                 last_seen = parts[0]
-            match = XRAY_USAGE_RE.search(line)
-            if match:
-                ips.add(match.group("ip"))
-        return {"hits": hits, "unique_ips": len(ips), "ips": sorted(ips), "first_seen": first_seen, "last_seen": last_seen}
+            ips.add(match.group("ip"))
+        if not tracked_emails:
+            total_tracked_hits = hits
+            active_tracked_emails = {client_email} if hits else set()
+        share = round((hits / total_tracked_hits) * 100, 1) if total_tracked_hits else 0
+        return {
+            "hits": hits,
+            "total_tracked_hits": total_tracked_hits,
+            "active_tracked_profiles": len(active_tracked_emails),
+            "share_percent": share,
+            "unique_ips": len(ips),
+            "ips": sorted(ips),
+            "first_seen": first_seen,
+            "last_seen": last_seen,
+        }
 
     def check_server_status(self) -> dict[str, Any]:
         client = self._connect()
@@ -1585,6 +1611,11 @@ fi
                 "guard": "systemctl is-active xray-profile-guard 2>/dev/null || true",
                 "ports": "ss -lnt '( sport = :443 or sport = :8443 or sport = :2053 )' | tail -n +2 || true",
                 "uptime": "uptime -p || true",
+                "load": "cat /proc/loadavg || true",
+                "cpu": "if command -v vmstat >/dev/null 2>&1; then vmstat 1 2 | tail -1 | awk '{print 100-$15}'; else awk '/^cpu /{u=$2+$3+$4+$7+$8+$9; t=$2+$3+$4+$5+$6+$7+$8+$9; if(t>0) printf \"%.0f\", u*100/t}' /proc/stat; fi || true",
+                "memory": "free -m | awk 'NR==2{print $3 \" \" $2 \" \" int($3*100/$2)}' || true",
+                "disk": "df -h / | awk 'NR==2{print $3 \" \" $2 \" \" $5}' || true",
+                "connections": "ss -Hnt state established '( sport = :443 or sport = :8443 or sport = :2053 )' | wc -l || true",
             }
             result: dict[str, Any] = {}
             for key, command in commands.items():
@@ -1613,7 +1644,7 @@ def admin_reply_markup() -> str:
             "keyboard": [
                 [{"text": "Получить VPN"}, {"text": "Моя подписка"}],
                 [{"text": "Список клиентов"}, {"text": "Бесплатные клиенты"}],
-                [{"text": "Проверить VPN"}],
+                [{"text": "Проверить VPN"}, {"text": "Ресурсы сервера"}],
             ],
             "resize_keyboard": True,
             "is_persistent": True,
@@ -1904,6 +1935,20 @@ def subscription_display(row: dict[str, Any]) -> str:
     return format_subscription(str(row.get("subscription_until") or ""))
 
 
+def request_status_ru(value: Any) -> str:
+    status = str(value or "").strip().lower()
+    mapping = {
+        "pending": "ожидает одобрения",
+        "approved": "одобрен",
+        "rejected": "отклонён",
+        "expired": "истёк",
+        "active": "активна",
+        "restored_no_deadline": "восстановлен без срока",
+        "waiting_manual_payment": "ожидает ручной оплаты",
+    }
+    return mapping.get(status, status or "-")
+
+
 def format_client_list(rows: list[dict[str, Any]], last_seen: dict[str, str]) -> str:
     if not rows:
         return "Платных клиентов пока нет. Бесплатные клиенты вынесены в отдельный раздел."
@@ -1927,8 +1972,8 @@ def format_client_card(row: dict[str, Any], last_seen: dict[str, str], number: i
     username = format_username(str(row.get("username") or ""))
     full_name = str(row.get("full_name") or "-")
     chat_id = str(row.get("chat_id") or "-")
-    status = str(row.get("status") or "-")
-    subscription_status = str(row.get("subscription_status") or "active")
+    status = request_status_ru(row.get("status"))
+    subscription_status = request_status_ru(row.get("subscription_status") or "active")
     subscription_text = subscription_display(row)
     free_text = "да" if row.get("is_free") else "нет"
     plan = plan_label(row.get("plan_id"))
@@ -1942,7 +1987,7 @@ def format_client_card(row: dict[str, Any], last_seen: dict[str, str], number: i
         f"Бесплатный: {free_text}\n"
         f"Активность: {format_age(last_seen.get(email))}\n"
         f"Chat ID: {chat_id}\n"
-        f"Xray: {email or '-'}"
+        f"Профиль в Xray: {email or '-'}"
     )
 
 
@@ -2036,27 +2081,121 @@ def send_client_card(bot: TelegramBot, manager: XrayManager, chat_id: int, row: 
 
 def format_usage_stats(row: dict[str, Any], stats: dict[str, Any]) -> str:
     ips = ", ".join(stats.get("ips") or []) or "-"
+    share = stats.get("share_percent", 0)
+    hits = int(stats.get("hits") or 0)
+    if hits >= 500 or float(share or 0) >= 50:
+        load_level = "высокая"
+    elif hits >= 100 or float(share or 0) >= 20:
+        load_level = "средняя"
+    elif hits > 0:
+        load_level = "низкая"
+    else:
+        load_level = "нет активности в последних логах"
     return (
-        f"Статистика профиля #{row.get('id')}\n"
-        f"Пользователь: {format_username(str(row.get('username') or ''))}\n"
-        f"Подключений в последних логах: {stats.get('hits', 0)}\n"
-        f"Уникальных IP: {stats.get('unique_ips', 0)}\n"
-        f"Первый лог: {format_age(str(stats.get('first_seen') or ''))}\n"
-        f"Последний лог: {format_age(str(stats.get('last_seen') or ''))}\n"
-        f"IP: {ips}"
+        f"Статистика профиля #{row.get('id')}\n\n"
+        "Клиент:\n"
+        f"- пользователь: {format_username(str(row.get('username') or ''))}\n"
+        f"- имя: {row.get('full_name') or '-'}\n"
+        f"- тариф: {plan_label(row.get('plan_id'))}\n\n"
+        "Нагрузка профиля:\n"
+        f"- уровень: {load_level}\n"
+        f"- подключений в последних логах: {hits}\n"
+        f"- доля от общей VPN-активности: {share}%\n"
+        f"- активных профилей в выборке: {stats.get('active_tracked_profiles', 0)}\n\n"
+        "Подозрение на передачу ссылки:\n"
+        f"- уникальных IP: {stats.get('unique_ips', 0)}\n"
+        f"- IP: {ips}\n\n"
+        "Время:\n"
+        f"- первый лог: {format_age(str(stats.get('first_seen') or ''))}\n"
+        f"- последний лог: {format_age(str(stats.get('last_seen') or ''))}\n\n"
+        "Важно: точный CPU/RAM по одному человеку Xray напрямую не отдаёт. Здесь показана реальная активность профиля по логам сервера."
     )
 
 
+def service_status_ru(value: Any) -> str:
+    status = str(value or "").strip().lower()
+    if status == "active":
+        return "работает"
+    if status == "inactive":
+        return "выключено"
+    if status == "failed":
+        return "ошибка"
+    if status == "activating":
+        return "запускается"
+    if status == "deactivating":
+        return "останавливается"
+    return status or "-"
+
+
+def uptime_ru(value: Any) -> str:
+    text = str(value or "").strip()
+    if text.startswith("up "):
+        text = text[3:]
+    replacements = {
+        "weeks": "нед.",
+        "week": "нед.",
+        "days": "дн.",
+        "day": "дн.",
+        "hours": "ч.",
+        "hour": "ч.",
+        "minutes": "мин.",
+        "minute": "мин.",
+    }
+    for source, target in replacements.items():
+        text = text.replace(source, target)
+    return text or "-"
+
+
+def memory_ru(value: Any) -> str:
+    parts = str(value or "").split()
+    if len(parts) >= 3:
+        return f"{parts[0]} из {parts[1]} МБ ({parts[2]}%)"
+    return str(value or "-")
+
+
+def disk_ru(value: Any) -> str:
+    parts = str(value or "").split()
+    if len(parts) >= 3:
+        return f"{parts[0]} из {parts[1]} ({parts[2]})"
+    return str(value or "-")
+
+
+def load_ru(value: Any) -> str:
+    parts = str(value or "").split()
+    if len(parts) >= 3:
+        return f"{parts[0]} / {parts[1]} / {parts[2]}"
+    return str(value or "-")
+
+
+def ports_ru(value: Any) -> str:
+    ports = []
+    for line in str(value or "").splitlines():
+        match = re.search(r":(443|8443|2053)\b", line)
+        if match:
+            port = match.group(1)
+            if port not in ports:
+                ports.append(port)
+    if not ports:
+        return "- открытых VPN-портов не найдено"
+    return "\n".join(f"- порт {port}: открыт" for port in sorted(ports, key=int))
+
+
 def format_vpn_status(status: dict[str, Any], config: Config) -> str:
-    ports = str(status.get("ports") or "нет открытых портов в выводе ss")
     reserve = config.reserve_vpn_host or "не настроен"
     return (
-        "Проверка VPN\n"
-        f"Xray: {status.get('xray') or '-'}\n"
-        f"Profile guard: {status.get('guard') or '-'}\n"
-        f"Uptime: {status.get('uptime') or '-'}\n"
-        f"Резервный хост: {reserve}\n\n"
-        f"Порты:\n{ports}"
+        "Состояние VPN-сервера\n\n"
+        "Службы:\n"
+        f"- Xray: {service_status_ru(status.get('xray'))}\n"
+        f"- защита профилей: {service_status_ru(status.get('guard'))}\n"
+        f"- время работы: {uptime_ru(status.get('uptime'))}\n"
+        f"- резервный хост: {reserve}\n\n"
+        "Ресурсы сервера:\n"
+        f"- CPU сейчас: {status.get('cpu') or '-'}%\n"
+        f"- нагрузка 1/5/15 мин: {load_ru(status.get('load'))}\n"
+        f"- память: {memory_ru(status.get('memory'))}\n"
+        f"- диск: {disk_ru(status.get('disk'))}\n"
+        f"- активные VPN TCP-подключения: {str(status.get('connections') or '0').strip()}\n\n"
+        f"Порты:\n{ports_ru(status.get('ports'))}"
     )
 
 
@@ -2189,7 +2328,7 @@ def handle_message(
         send_routing_instructions(bot, config, chat_id)
         return
 
-    if text.startswith("/check_vpn") or text.lower() == "проверить vpn":
+    if text.startswith("/check_vpn") or text.lower() in {"проверить vpn", "ресурсы сервера", "состояние сервера"}:
         if chat_id not in config.admin_chat_ids:
             bot.send_message(chat_id, "Эта команда доступна только админу.")
             return
@@ -2724,7 +2863,12 @@ def handle_callback(
             return
         bot.safe_answer_callback_query(callback_id, "Собираю статистику...")
         try:
-            stats = manager.get_usage_stats(str(row["client_email"]))
+            all_emails = [
+                str(item.get("client_email") or "")
+                for item in store.list_approved_requests()
+                if item.get("client_email")
+            ]
+            stats = manager.get_usage_stats(str(row["client_email"]), all_emails)
             bot.send_message(user_chat_id, format_usage_stats(row, stats), admin_client_markup(row))
         except Exception as exc:
             logging.exception("Could not load client stats")
