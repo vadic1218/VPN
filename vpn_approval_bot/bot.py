@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from html import escape
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -320,6 +321,29 @@ def happ_routing_redirect_url(config: Config) -> str:
     if not config.public_base_url:
         return ""
     return f"{config.public_base_url}/happ-routing"
+
+
+def happ_routing_qr_url(config: Config) -> str:
+    if not config.public_base_url:
+        return ""
+    return f"{config.public_base_url}/happ-routing-qr.png"
+
+
+def build_qr_png(data: str) -> bytes:
+    import qrcode
+
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=6,
+        border=4,
+    )
+    qr.add_data(data)
+    qr.make(fit=True)
+    image = qr.make_image(fill_color="black", back_color="white")
+    output = BytesIO()
+    image.save(output, format="PNG")
+    return output.getvalue()
 
 
 def plan_change_payment_text(config: Config, request_id: int, plan_id: str | int | None, payment_method: str) -> str:
@@ -1034,9 +1058,13 @@ def start_routing_web_server(config: Config) -> None:
 
         def _send_text(self, status: int, body: str, content_type: str = "text/plain; charset=utf-8") -> None:
             payload = body.encode("utf-8")
+            self._send_bytes(status, payload, content_type)
+
+        def _send_bytes(self, status: int, payload: bytes, content_type: str) -> None:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(payload)
 
@@ -1044,6 +1072,14 @@ def start_routing_web_server(config: Config) -> None:
             path = self.path.split("?", 1)[0]
             if path in {"/", "/healthz"}:
                 self._send_text(200, "ok\n")
+                return
+            if path == "/happ-routing-qr.png":
+                try:
+                    qr_target = happ_routing_redirect_url(config) or build_happ_routing_link()
+                    self._send_bytes(200, build_qr_png(qr_target), "image/png")
+                except Exception:
+                    logging.exception("Could not build Happ routing QR")
+                    self._send_text(500, "qr error\n")
                 return
             if path != "/happ-routing":
                 self._send_text(404, "not found\n")
@@ -1862,7 +1898,7 @@ def send_routing_instructions(bot: TelegramBot, config: Config, chat_id: int, re
         "Российские сервисы, банки, VK, Госуслуги, Яндекс и капчи будут идти напрямую, мимо VPN.\n\n"
         "Отсканируй QR через Happ или нажми кнопку ниже, чтобы открыть Happ."
     )
-    qr_source = qr_url_for_link(routing_link)
+    qr_source = happ_routing_qr_url(config) or qr_url_for_link(routing_link)
     if not open_url:
         bot.send_photo(chat_id, qr_source, caption, reply_markup)
         bot.send_message(
