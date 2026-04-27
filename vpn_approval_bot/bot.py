@@ -32,6 +32,8 @@ SHARING_LOOKBACK_MINUTES = 10
 SHARING_IP_GRACE = 1
 SHARING_ALERT_COOLDOWN_MINUTES = 30
 DEFAULT_SUBSCRIPTION_DAYS = 30
+SUBSCRIPTION_NOTICE_DAYS = (3, 1)
+INACTIVE_CLEANUP_DAYS = 60
 XRAY_USAGE_RE = re.compile(
     r"from (?:tcp:)?(?P<ip>\d+\.\d+\.\d+\.\d+):\d+ accepted .* email: (?P<email>\S+)"
 )
@@ -71,6 +73,7 @@ class Config:
     remote_state_path: str
     public_base_url: str
     web_port: int
+    reserve_vpn_host: str
 
 
 OPERATOR_PROFILES: dict[str, dict[str, str]] = {
@@ -406,6 +409,18 @@ def admin_plan_button_rows(request_id: int) -> list[list[dict[str, str]]]:
     return [buttons[index : index + 2] for index in range(0, len(buttons), 2)]
 
 
+def admin_extend_button_rows(request_id: int) -> list[list[dict[str, str]]]:
+    return [
+        [
+            {"text": "+7 дней", "callback_data": f"extend:7:{request_id}"},
+            {"text": "+30 дней", "callback_data": f"extend:30:{request_id}"},
+            {"text": "+90 дней", "callback_data": f"extend:90:{request_id}"},
+        ],
+        [{"text": "Продлить до даты", "callback_data": f"extend_until_help:{request_id}"}],
+        [{"text": "Назад к клиенту", "callback_data": f"client:{request_id}"}],
+    ]
+
+
 def _get(raw: dict[str, Any], env_name: str, default: str = "") -> str:
     return os.getenv(env_name, str(raw.get(env_name.lower(), default))).strip()
 
@@ -471,6 +486,7 @@ def load_config() -> Config:
         payment_banks=_get(raw, "PAYMENT_BANKS", "Сбер / Т-Банк"),
         public_base_url=_get(raw, "PUBLIC_BASE_URL", default_public_base_url).rstrip("/"),
         web_port=int(_get(raw, "PORT", "0") or "0"),
+        reserve_vpn_host=_get(raw, "RESERVE_VPN_HOST"),
     )
 
 
@@ -844,6 +860,25 @@ class Store:
             return request
         return None
 
+    def set_subscription_until(self, request_id: int, until: datetime) -> dict[str, Any] | None:
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=timezone.utc)
+        data = self._read()
+        for request in data["requests"]:
+            if int(request["id"]) != request_id:
+                continue
+            request["subscription_until"] = until.isoformat(timespec="seconds")
+            request["subscription_status"] = "active"
+            request["subscription_set_at"] = utc_now_iso()
+            if request.get("status") == "expired":
+                request["status"] = "approved"
+            notices = data.setdefault("subscription_notices", {})
+            if isinstance(notices, dict):
+                notices.pop(str(request_id), None)
+            self._write(data)
+            return request
+        return None
+
     def request_plan_change(self, request_id: int, plan_id: str, payment_method: str) -> dict[str, Any] | None:
         plan = plan_info(plan_id)
         data = self._read()
@@ -951,6 +986,55 @@ class Store:
             if until.tzinfo is None:
                 until = until.replace(tzinfo=timezone.utc)
             if until <= now:
+                result.append(request)
+        return result
+
+    def find_subscription_notice_requests(self, days_before: int) -> list[dict[str, Any]]:
+        now = datetime.now(timezone.utc)
+        notices = self._read().setdefault("subscription_notices", {})
+        sent_for_day = notices if isinstance(notices, dict) else {}
+        result: list[dict[str, Any]] = []
+        for request in self.list_approved_requests():
+            if request.get("is_free"):
+                continue
+            request_id = str(request.get("id") or "")
+            already_sent = sent_for_day.get(request_id, []) if isinstance(sent_for_day, dict) else []
+            if str(days_before) in [str(item) for item in already_sent]:
+                continue
+            until = parse_iso_time(str(request.get("subscription_until") or ""))
+            if not until:
+                continue
+            if until.tzinfo is None:
+                until = until.replace(tzinfo=timezone.utc)
+            seconds_left = (until - now).total_seconds()
+            if 0 < seconds_left <= days_before * 86400:
+                result.append(request)
+        return result
+
+    def mark_subscription_notice(self, request_id: int, days_before: int) -> None:
+        data = self._read()
+        notices = data.setdefault("subscription_notices", {})
+        if not isinstance(notices, dict):
+            notices = {}
+            data["subscription_notices"] = notices
+        values = notices.setdefault(str(request_id), [])
+        if str(days_before) not in [str(item) for item in values]:
+            values.append(str(days_before))
+        self._write(data)
+
+    def find_inactive_requests(self, last_seen: dict[str, str], inactive_days: int = INACTIVE_CLEANUP_DAYS) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        now = datetime.now(timezone.utc)
+        for request in self.list_approved_requests():
+            if request.get("is_free"):
+                continue
+            email = str(request.get("client_email") or "")
+            seen_at = parse_iso_time(last_seen.get(email, ""))
+            if not seen_at:
+                continue
+            if seen_at.tzinfo is None:
+                seen_at = seen_at.replace(tzinfo=timezone.utc)
+            if now - seen_at >= timedelta(days=inactive_days):
                 result.append(request)
         return result
 
@@ -1456,12 +1540,57 @@ fi
                 result[email].add(match.group("ip"))
         return result
 
+    def get_usage_stats(self, client_email: str, lines: int = 20000) -> dict[str, Any]:
+        client = self._connect()
+        try:
+            command = f"journalctl -u xray -n {int(lines)} -o short-iso --no-pager || true"
+            rc, out, err = self._run(client, command)
+            if rc != 0:
+                raise RuntimeError((err or "Could not read Xray journal").strip()[:500])
+        finally:
+            client.close()
 
-def build_vless_link(config: Config, client_uuid: str, profile_type: str, label: str) -> str:
+        hits = 0
+        ips: set[str] = set()
+        first_seen = ""
+        last_seen = ""
+        for line in out.splitlines():
+            if f"email: {client_email}" not in line:
+                continue
+            hits += 1
+            parts = line.split(maxsplit=1)
+            if parts:
+                first_seen = first_seen or parts[0]
+                last_seen = parts[0]
+            match = XRAY_USAGE_RE.search(line)
+            if match:
+                ips.add(match.group("ip"))
+        return {"hits": hits, "unique_ips": len(ips), "ips": sorted(ips), "first_seen": first_seen, "last_seen": last_seen}
+
+    def check_server_status(self) -> dict[str, Any]:
+        client = self._connect()
+        try:
+            commands = {
+                "xray": "systemctl is-active xray || true",
+                "guard": "systemctl is-active xray-profile-guard 2>/dev/null || true",
+                "ports": "ss -lnt '( sport = :443 or sport = :8443 or sport = :2053 )' | tail -n +2 || true",
+                "uptime": "uptime -p || true",
+            }
+            result: dict[str, Any] = {}
+            for key, command in commands.items():
+                _, out, err = self._run(client, command)
+                result[key] = (out or err).strip()
+            return result
+        finally:
+            client.close()
+
+
+def build_vless_link(config: Config, client_uuid: str, profile_type: str, label: str, host: str | None = None) -> str:
     port = profile_port(config, profile_type)
     fragment = quote(label)
+    vpn_host = host or config.vpn_host
     return (
-        f"vless://{client_uuid}@{config.vpn_host}:{port}"
+        f"vless://{client_uuid}@{vpn_host}:{port}"
         f"?encryption=none&flow=xtls-rprx-vision&security=reality"
         f"&sni={quote(config.vpn_sni)}&fp=chrome&pbk={quote(config.vpn_public_key)}"
         f"&sid={quote(config.vpn_short_id)}&type=tcp&headerType=none&spx=%2F#{fragment}"
@@ -1474,6 +1603,7 @@ def admin_reply_markup() -> str:
             "keyboard": [
                 [{"text": "Получить VPN"}, {"text": "Моя подписка"}],
                 [{"text": "Список клиентов"}, {"text": "Бесплатные клиенты"}],
+                [{"text": "Проверить VPN"}],
             ],
             "resize_keyboard": True,
             "is_persistent": True,
@@ -1642,26 +1772,56 @@ def admin_reissue_request_markup(request_id: int, profile_type: str) -> str:
 
 def admin_client_markup(row: dict[str, Any]) -> str:
     request_id = int(row["id"])
+    rows = [
+        [
+            {"text": "Продление", "callback_data": f"client_extend:{request_id}"},
+            {"text": "Тариф", "callback_data": f"client_plan:{request_id}"},
+        ],
+        [
+            {"text": "Оператор", "callback_data": f"client_operator:{request_id}"},
+            {"text": "Статистика", "callback_data": f"client_stats:{request_id}"},
+        ],
+        [
+            {"text": "Резервная ссылка", "callback_data": f"reserve_link:{request_id}"},
+            {"text": "Доступ", "callback_data": f"client_access:{request_id}"},
+        ],
+    ]
+    return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
+
+
+def admin_client_extend_markup(row: dict[str, Any]) -> str:
+    request_id = int(row["id"])
+    rows = [] if row.get("is_free") else admin_extend_button_rows(request_id)
+    if row.get("is_free"):
+        rows.append([{"text": "Бесплатный клиент: продление не нужно", "callback_data": f"client:{request_id}"}])
+        rows.append([{"text": "Назад к клиенту", "callback_data": f"client:{request_id}"}])
+    return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
+
+
+def admin_client_plan_markup(row: dict[str, Any]) -> str:
+    request_id = int(row["id"])
+    rows = admin_plan_button_rows(request_id)
+    rows.append([{"text": "Назад к клиенту", "callback_data": f"client:{request_id}"}])
+    return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
+
+
+def admin_client_operator_markup(row: dict[str, Any]) -> str:
+    request_id = int(row["id"])
+    rows = profile_button_rows("reissue", request_id)
+    rows.append([{"text": "Назад к клиенту", "callback_data": f"client:{request_id}"}])
+    return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
+
+
+def admin_client_access_markup(row: dict[str, Any]) -> str:
+    request_id = int(row["id"])
     rows = []
-    if not row.get("is_free"):
-        rows.append(
-            [
-                {"text": "+7 дней", "callback_data": f"extend:7:{request_id}"},
-                {"text": "+30 дней", "callback_data": f"extend:30:{request_id}"},
-                {"text": "+90 дней", "callback_data": f"extend:90:{request_id}"},
-            ]
-        )
-    rows.extend(admin_plan_button_rows(request_id))
-    rows.extend(profile_button_rows("reissue", request_id))
     if row.get("is_free"):
         rows.append([{"text": "Убрать бесплатный доступ", "callback_data": f"free:off:{request_id}"}])
     else:
         rows.append([{"text": "Сделать бесплатным", "callback_data": f"free:on:{request_id}"}])
     rows.append([{"text": "Отключить пользователя", "callback_data": f"disable:{request_id}"}])
-    return json.dumps(
-        {"inline_keyboard": rows},
-        ensure_ascii=False,
-    )
+    rows.append([{"text": "Назад к клиенту", "callback_data": f"client:{request_id}"}])
+    return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
 
 
 def sharing_alert_markup(request_id: int, profile_type: str) -> str:
@@ -1757,30 +1917,36 @@ def format_client_card(row: dict[str, Any], last_seen: dict[str, str], number: i
     username = format_username(str(row.get("username") or ""))
     full_name = str(row.get("full_name") or "-")
     chat_id = str(row.get("chat_id") or "-")
-    client_uuid = str(row.get("uuid") or "-")
     status = str(row.get("status") or "-")
-    created_at = str(row.get("created_at") or "-")
-    decided_at = str(row.get("decided_at") or "-")
     subscription_status = str(row.get("subscription_status") or "active")
     subscription_text = subscription_display(row)
     free_text = "да" if row.get("is_free") else "нет"
     plan = plan_label(row.get("plan_id"))
-    restored = "да" if row.get("restored_from_xray") else "нет"
     return (
-        f"Клиент #{number}\n"
+        f"Клиент #{number} | профиль #{row.get('id')}\n"
+        f"{username} | {full_name}\n\n"
         f"Статус: {status}\n"
         f"Подписка: {subscription_status}, {subscription_text}\n"
-        f"Бесплатный доступ: {free_text}\n"
         f"Тариф: {plan}\n"
+        f"Оператор: {profile_type}\n"
+        f"Бесплатный: {free_text}\n"
+        f"Активность: {format_age(last_seen.get(email))}\n"
         f"Chat ID: {chat_id}\n"
-        f"Username: {username}\n"
-        f"Имя: {full_name}\n"
-        f"Тип: {profile_type}\n"
-        f"Email в Xray: {email or '-'}\n"
-        f"UUID: {client_uuid}\n"
+        f"Xray: {email or '-'}"
+    )
+
+
+def format_client_details(row: dict[str, Any], last_seen: dict[str, str]) -> str:
+    email = str(row.get("client_email") or "")
+    created_at = str(row.get("created_at") or "-")
+    decided_at = str(row.get("decided_at") or "-")
+    restored = "да" if row.get("restored_from_xray") else "нет"
+    return (
+        format_client_card(row, last_seen, int(row.get("id") or 0))
+        + "\n\n"
+        f"UUID: {row.get('uuid') or '-'}\n"
         f"Создан: {created_at} ({format_age(created_at)})\n"
         f"Одобрен/обновлён: {decided_at} ({format_age(decided_at)})\n"
-        f"Активность: {format_age(last_seen.get(email))}\n"
         f"Восстановлен из Xray: {restored}"
     )
 
@@ -1846,6 +2012,42 @@ def send_admin_result(bot: TelegramBot, admin_chat_id: int, user_chat_id: int, u
         return
     bot.send_message(user_chat_id, user_text)
     bot.send_message(admin_chat_id, admin_text)
+
+
+def send_client_card(bot: TelegramBot, manager: XrayManager, chat_id: int, row: dict[str, Any], markup: str | None = None) -> None:
+    email = str(row.get("client_email") or "")
+    try:
+        last_seen = manager.get_last_seen_by_email([email]) if email else {}
+    except Exception:
+        logging.exception("Could not load single client activity")
+        last_seen = {}
+    bot.send_message(chat_id, format_client_card(row, last_seen, int(row.get("id") or 0)), markup or admin_client_markup(row))
+
+
+def format_usage_stats(row: dict[str, Any], stats: dict[str, Any]) -> str:
+    ips = ", ".join(stats.get("ips") or []) or "-"
+    return (
+        f"Статистика профиля #{row.get('id')}\n"
+        f"Пользователь: {format_username(str(row.get('username') or ''))}\n"
+        f"Подключений в последних логах: {stats.get('hits', 0)}\n"
+        f"Уникальных IP: {stats.get('unique_ips', 0)}\n"
+        f"Первый лог: {format_age(str(stats.get('first_seen') or ''))}\n"
+        f"Последний лог: {format_age(str(stats.get('last_seen') or ''))}\n"
+        f"IP: {ips}"
+    )
+
+
+def format_vpn_status(status: dict[str, Any], config: Config) -> str:
+    ports = str(status.get("ports") or "нет открытых портов в выводе ss")
+    reserve = config.reserve_vpn_host or "не настроен"
+    return (
+        "Проверка VPN\n"
+        f"Xray: {status.get('xray') or '-'}\n"
+        f"Profile guard: {status.get('guard') or '-'}\n"
+        f"Uptime: {status.get('uptime') or '-'}\n"
+        f"Резервный хост: {reserve}\n\n"
+        f"Порты:\n{ports}"
+    )
 
 
 def send_payment_instructions(
@@ -1967,13 +2169,59 @@ def handle_message(
             "/reissue - перевыпуск ссылки\n"
             "/change_plan - сменить тариф\n"
             "/routing - правила TikTok/Яндекс/банки\n"
-            "/subscription - срок подписки",
+            "/subscription - срок подписки\n"
+            "/check_vpn - проверить VPN, только для админа",
             reply_markup,
         )
         return
 
     if text.startswith("/routing") or text.lower() == "маршрутизация":
         send_routing_instructions(bot, config, chat_id)
+        return
+
+    if text.startswith("/check_vpn") or text.lower() == "проверить vpn":
+        if chat_id not in config.admin_chat_ids:
+            bot.send_message(chat_id, "Эта команда доступна только админу.")
+            return
+        try:
+            bot.send_message(chat_id, format_vpn_status(manager.check_server_status(), config), admin_reply_markup())
+        except Exception as exc:
+            logging.exception("VPN status check failed")
+            bot.send_message(chat_id, f"Не смог проверить VPN: {exc}", admin_reply_markup())
+        return
+
+    if text.startswith("/extend_until"):
+        if chat_id not in config.admin_chat_ids:
+            bot.send_message(chat_id, "Эта команда доступна только админу.")
+            return
+        parts = text.split()
+        if len(parts) != 3 or not parts[1].isdigit():
+            bot.send_message(chat_id, "Формат: /extend_until ID YYYY-MM-DD")
+            return
+        request_id = int(parts[1])
+        try:
+            until = datetime.strptime(parts[2], "%Y-%m-%d").replace(hour=23, minute=59, second=59, tzinfo=timezone.utc)
+        except ValueError:
+            bot.send_message(chat_id, "Дата должна быть в формате YYYY-MM-DD, например 2026-05-30.")
+            return
+        row = store.get_request(request_id)
+        if not row:
+            bot.send_message(chat_id, "Профиль не найден.")
+            return
+        if row.get("status") == "expired" and row.get("client_email") and row.get("uuid"):
+            try:
+                manager.save_client(str(row["client_email"]), str(row["uuid"]))
+            except Exception as exc:
+                logging.exception("Failed to restore expired VPN profile for exact-date extension")
+                bot.send_message(chat_id, f"Не смог включить просроченный профиль #{request_id}: {exc}")
+                return
+        updated = store.set_subscription_until(request_id, until)
+        if not updated:
+            bot.send_message(chat_id, "Не смог изменить дату подписки.")
+            return
+        text_out = f"Подписка профиля #{request_id} установлена до {parts[2]}."
+        bot.send_message(chat_id, text_out, admin_reply_markup())
+        bot.send_message(int(updated["chat_id"]), f"Твоя VPN-подписка продлена до {parts[2]}.")
         return
 
     if text.startswith("/clients") or text.lower() == "список клиентов":
@@ -2424,6 +2672,80 @@ def handle_callback(
         bot.answer_callback_query(callback_id, "Нет доступа.")
         return
 
+    if parts[0] == "client" and len(parts) == 2 and parts[1].isdigit():
+        request_id = int(parts[1])
+        row = store.get_request(request_id)
+        if not row:
+            bot.answer_callback_query(callback_id, "Профиль не найден.")
+            return
+        bot.answer_callback_query(callback_id, "Карточка клиента.")
+        send_client_card(bot, manager, user_chat_id, row)
+        return
+
+    if parts[0] in {"client_extend", "client_plan", "client_operator", "client_access"} and len(parts) == 2 and parts[1].isdigit():
+        request_id = int(parts[1])
+        row = store.get_request(request_id)
+        if not row:
+            bot.answer_callback_query(callback_id, "Профиль не найден.")
+            return
+        title = {
+            "client_extend": "Продление подписки",
+            "client_plan": "Смена тарифа",
+            "client_operator": "Перевыпуск под оператора",
+            "client_access": "Доступ клиента",
+        }[parts[0]]
+        markup = {
+            "client_extend": admin_client_extend_markup,
+            "client_plan": admin_client_plan_markup,
+            "client_operator": admin_client_operator_markup,
+            "client_access": admin_client_access_markup,
+        }[parts[0]](row)
+        bot.answer_callback_query(callback_id, title)
+        bot.send_message(user_chat_id, f"{title} для профиля #{request_id}", markup)
+        return
+
+    if parts[0] == "client_stats" and len(parts) == 2 and parts[1].isdigit():
+        request_id = int(parts[1])
+        row = store.get_request(request_id)
+        if not row or not row.get("client_email"):
+            bot.answer_callback_query(callback_id, "Профиль не найден.")
+            return
+        bot.safe_answer_callback_query(callback_id, "Собираю статистику...")
+        try:
+            stats = manager.get_usage_stats(str(row["client_email"]))
+            bot.send_message(user_chat_id, format_usage_stats(row, stats), admin_client_markup(row))
+        except Exception as exc:
+            logging.exception("Could not load client stats")
+            bot.send_message(user_chat_id, f"Не смог получить статистику профиля #{request_id}: {exc}", admin_client_markup(row))
+        return
+
+    if parts[0] == "extend_until_help" and len(parts) == 2 and parts[1].isdigit():
+        request_id = int(parts[1])
+        bot.answer_callback_query(callback_id, "Отправь дату сообщением.")
+        bot.send_message(
+            user_chat_id,
+            f"Чтобы продлить профиль #{request_id} до конкретной даты, отправь:\n/extend_until {request_id} YYYY-MM-DD\n\nНапример:\n/extend_until {request_id} 2026-05-30",
+            admin_client_markup({"id": request_id}),
+        )
+        return
+
+    if parts[0] == "reserve_link" and len(parts) == 2 and parts[1].isdigit():
+        request_id = int(parts[1])
+        row = store.get_request(request_id)
+        if not row or not row.get("uuid"):
+            bot.answer_callback_query(callback_id, "Профиль не найден.")
+            return
+        if not config.reserve_vpn_host:
+            bot.answer_callback_query(callback_id, "Резервный сервер не настроен.")
+            bot.send_message(user_chat_id, "Резервная ссылка появится после настройки переменной RESERVE_VPN_HOST.", admin_client_markup(row))
+            return
+        profile_type = str(row.get("profile_type") or "default")
+        label = f"VPN {request_id} reserve"
+        link = build_vless_link(config, str(row["uuid"]), profile_type, label, host=config.reserve_vpn_host)
+        bot.answer_callback_query(callback_id, "Резервная ссылка создана.")
+        bot.send_message(user_chat_id, f"Резервная ссылка профиля #{request_id}:\n\n{link}", admin_client_markup(row))
+        return
+
     if parts[0] == "setplan" and len(parts) == 3 and parts[2].isdigit():
         plan_id = parts[1]
         request_id = int(parts[2])
@@ -2706,6 +3028,21 @@ def check_sharing_alerts(bot: TelegramBot, store: Store, config: Config, manager
 
 
 def check_expired_subscriptions(bot: TelegramBot, store: Store, config: Config, manager: XrayManager) -> None:
+    for days_before in SUBSCRIPTION_NOTICE_DAYS:
+        for row in store.find_subscription_notice_requests(days_before):
+            request_id = int(row["id"])
+            until_text = subscription_display(row)
+            bot.send_message(
+                int(row["chat_id"]),
+                f"Напоминание: подписка VPN-профиля #{request_id} скоро закончится: {until_text}.",
+            )
+            for admin_chat_id in config.admin_chat_ids:
+                bot.send_message(
+                    admin_chat_id,
+                    f"Подписка скоро закончится: профиль #{request_id}, пользователь {format_username(str(row.get('username') or ''))}, {until_text}.",
+                )
+            store.mark_subscription_notice(request_id, days_before)
+
     for row in store.find_expired_requests():
         request_id = int(row["id"])
         client_email = str(row.get("client_email") or "")
@@ -2722,6 +3059,33 @@ def check_expired_subscriptions(bot: TelegramBot, store: Store, config: Config, 
         bot.send_message(int(row["chat_id"]), text)
         for admin_chat_id in config.admin_chat_ids:
             bot.send_message(admin_chat_id, f"{text}\nПользователь: {username}\nChat ID: {row['chat_id']}")
+
+
+def check_inactive_clients(bot: TelegramBot, store: Store, config: Config, manager: XrayManager) -> None:
+    rows = store.list_approved_requests()
+    emails = [str(row.get("client_email") or "") for row in rows if row.get("client_email")]
+    if not emails:
+        return
+    last_seen = manager.get_last_seen_by_email(emails)
+    for row in store.find_inactive_requests(last_seen):
+        request_id = int(row["id"])
+        marker = f"inactive_notice_{INACTIVE_CLEANUP_DAYS}d"
+        if row.get(marker):
+            continue
+        username = format_username(str(row.get("username") or ""))
+        text = (
+            f"Профиль #{request_id} неактивен больше {INACTIVE_CLEANUP_DAYS} дней.\n"
+            f"Пользователь: {username}\n"
+            f"Последняя активность: {format_age(last_seen.get(str(row.get('client_email') or '')))}\n\n"
+            "Автоотключение не выполнено, чтобы случайно не удалить живого клиента. Можно отключить вручную из карточки."
+        )
+        for admin_chat_id in config.admin_chat_ids:
+            bot.send_message(admin_chat_id, text, admin_client_markup(row))
+        data = store._read()
+        for request in data["requests"]:
+            if int(request.get("id") or 0) == request_id:
+                request[marker] = utc_now_iso()
+        store._write(data)
 
 
 def main() -> None:
@@ -2764,6 +3128,7 @@ def main() -> None:
             if now - last_subscription_check >= SUBSCRIPTION_CHECK_INTERVAL_SECONDS:
                 try:
                     check_expired_subscriptions(bot, store, config, manager)
+                    check_inactive_clients(bot, store, config, manager)
                 except Exception:
                     logging.exception("Subscription expiration check failed")
                 last_subscription_check = now

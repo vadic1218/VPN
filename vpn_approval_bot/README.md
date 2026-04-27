@@ -42,9 +42,15 @@ Admins can mark approved users as free clients from the client card. Free client
 
 Free client cards do not show subscription extension buttons, because they are not controlled by paid subscription dates. Admins can still change the device plan for both paid and free clients directly from the client card; this updates the saved device limit without changing the VPN link.
 
+Client cards use compact action menus. The main card shows only high-level sections: subscription extension, tariff, operator/reissue, statistics, reserve link, and access controls. Each section opens its own inline submenu so the chat is not filled with every possible action at once.
+
+Admins can run `/check_vpn` or press `Проверить VPN` to see Xray status, profile-guard status, listening ports, uptime, and whether `RESERVE_VPN_HOST` is configured. If `RESERVE_VPN_HOST` is set, the client card can generate a reserve VLESS link for the same UUID using that host.
+
 Xray config writes are serialized with a remote lock before the bot adds, reissues, or disables a profile. This prevents overlapping approvals from corrupting the config or stacking multiple Xray restarts. The current server does not expose the Xray API, so profile add/remove operations can still cause a short reconnect while Xray restarts; fully zero-drop provisioning requires enabling the Xray API in a separate migration.
 
 The bot also watches recent Xray logs for soft sharing detection. If one approved profile appears from two or more different IPs within the recent activity window, admins receive a warning with `Отключить`, `Перевыпустить`, and `Игнорировать` actions. The bot does not auto-block users from this check.
+
+The subscription checker also sends reminders before expiration, currently at 3 days and 1 day before the deadline. Admins can set an exact subscription date with `/extend_until ID YYYY-MM-DD`. The bot monitors inactive paid clients and notifies admins if a profile has not appeared in recent activity for the configured inactivity window; it does not auto-delete those profiles without admin confirmation.
 
 ## Setup
 
@@ -101,6 +107,7 @@ VPN_DEFAULT_PORT
 VPN_MTS_PORT
 VPN_ALT_PORT
 VPN_DEFAULT_SUBSCRIPTION_DAYS
+RESERVE_VPN_HOST
 PAYMENT_QR_URL
 PAYMENT_LINK
 PAYMENT_TBANK_LINK
@@ -123,6 +130,7 @@ VPN_DEFAULT_PORT=443
 VPN_MTS_PORT=8443
 VPN_ALT_PORT=2053
 VPN_DEFAULT_SUBSCRIPTION_DAYS=30
+RESERVE_VPN_HOST=
 PAYMENT_LINK=https://www.sberbank.com/sms/pbpn?requisiteNumber=79050122709
 PAYMENT_TBANK_LINK=https://www.tinkoff.ru/rm/r_fpDGcUCZRx.uCrfsYPegf/WuswZ21804
 PAYMENT_QR_URL=
