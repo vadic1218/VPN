@@ -2182,6 +2182,7 @@ def ports_ru(value: Any) -> str:
 
 def format_vpn_status(status: dict[str, Any], config: Config) -> str:
     reserve = config.reserve_vpn_host or "не настроен"
+    connections = str(status.get("connections") or "0").strip()
     return (
         "Состояние VPN-сервера\n\n"
         "Службы:\n"
@@ -2194,7 +2195,8 @@ def format_vpn_status(status: dict[str, Any], config: Config) -> str:
         f"- нагрузка 1/5/15 мин: {load_ru(status.get('load'))}\n"
         f"- память: {memory_ru(status.get('memory'))}\n"
         f"- диск: {disk_ru(status.get('disk'))}\n"
-        f"- активные VPN TCP-подключения: {str(status.get('connections') or '0').strip()}\n\n"
+        f"- активные TCP-соединения VPN: {connections}\n"
+        "- это не количество людей: один телефон или ноутбук может держать много соединений одновременно\n\n"
         f"Порты:\n{ports_ru(status.get('ports'))}"
     )
 
@@ -2312,6 +2314,15 @@ def handle_message(
             "Привет. Этот бот выдаёт VPN после одобрения админом.\n\n"
             + price_list_text()
             + "\n\n"
+            "Как подключить:\n"
+            "1. Нажми «Получить VPN».\n"
+            "2. Выбери тариф и оператора. Если не знаешь оператора, выбирай «Обычный оператор».\n"
+            "3. После одобрения бот пришлёт VPN-ссылку.\n"
+            "4. Открой ссылку в Happ и нажми подключить.\n\n"
+            "Маршрутизация:\n"
+            "1. Нажми «Моя подписка».\n"
+            "2. Нажми кнопку маршрутизации Happ.\n"
+            "3. Добавь правила в Happ. TikTok пойдёт через VPN, а Яндекс, банки, VK и Госуслуги будут идти напрямую.\n\n"
             "Команды:\n"
             "/vpn - выбрать оператора и отправить заявку на VPN\n"
             "/vpn_status ID - проверить заявку\n"
