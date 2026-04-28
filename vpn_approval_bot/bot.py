@@ -3671,11 +3671,6 @@ def main() -> None:
     store = Store(config.db_path)
     bot = TelegramBot(config.telegram_token)
     manager = XrayManager(config)
-    try:
-        guard_status = manager.ensure_profile_guard_enabled()
-        logging.info("Profile guard enabled: %s", guard_status.get("guard"))
-    except Exception:
-        logging.exception("Could not enable profile guard")
     remote_state_checked = False
     try:
         remote_state = manager.load_state_backup()

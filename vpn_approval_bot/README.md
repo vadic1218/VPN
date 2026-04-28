@@ -50,8 +50,8 @@ The bot counts devices by separate Xray/VLESS profiles, not by Wi-Fi or IP addre
 - Each added device gets its own UUID and Xray email like `tg-CHAT-REQUEST-d2`.
 - If a tariff is downgraded below the current device count, extra device links are removed from Xray and stop working.
 - Sharing detection now checks each device link separately. One device link appearing from several IPs can trigger a sharing warning.
-- `xray-profile-guard` is enabled automatically on startup. It binds each profile email to the first public IP seen in Xray logs and adds Xray routing rules that block the same link from other IPs.
-- Important limitation: VLESS/Happ does not send a stable hardware device ID to the server, so two devices behind the same public Wi-Fi IP cannot be perfectly distinguished by Xray alone. Separate per-device links are still required.
+- Important limitation: VLESS/Happ does not send a stable hardware device ID to the server, so two devices behind the same public Wi-Fi IP cannot be perfectly distinguished by Xray alone. Separate per-device links are required.
+- The old strict `xray-profile-guard` IP binding is intentionally not auto-enabled because it binds links to Wi-Fi/mobile public IPs, not to real devices, and can break honest users when their network changes.
 
 ## Admin Features
 
