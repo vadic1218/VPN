@@ -845,8 +845,17 @@ class Store:
 
     def import_approved_clients(self, clients: list[dict[str, str]]) -> int:
         data = self._read()
-        existing_emails = {str(item.get("client_email") or "") for item in data["requests"]}
-        existing_ids = {int(item["id"]) for item in data["requests"] if str(item.get("id") or "").isdigit()}
+        existing_emails = {
+            email
+            for item in data["requests"]
+            for email in request_device_emails(item) + [str(item.get("client_email") or "")]
+            if email
+        }
+        requests_by_id = {
+            int(item["id"]): item
+            for item in data["requests"]
+            if str(item.get("id") or "").isdigit()
+        }
         imported = 0
         now = utc_now_iso()
 
@@ -858,8 +867,28 @@ class Store:
                 continue
 
             request_id = int(match.group("request_id"))
-            while request_id in existing_ids:
-                request_id += 1
+            device_id = int(match.group("device_id") or 1)
+            existing_request = requests_by_id.get(request_id)
+            if existing_request:
+                devices = request_devices(existing_request)
+                if not any(str(device.get("client_email") or "") == email for device in devices):
+                    devices.append(
+                        {
+                            "device_id": device_id,
+                            "name": f"Устройство {device_id}",
+                            "client_email": email,
+                            "uuid": client_uuid,
+                            "profile_type": str(existing_request.get("profile_type") or "default"),
+                            "created_at": now,
+                        }
+                    )
+                    existing_request["devices"] = sorted(devices, key=lambda item: int(item.get("device_id") or 0))
+                    if device_id == 1:
+                        existing_request["client_email"] = email
+                        existing_request["uuid"] = client_uuid
+                    existing_emails.add(email)
+                    imported += 1
+                continue
 
             data["requests"].append(
                 {
@@ -892,13 +921,56 @@ class Store:
                 }
             )
             existing_emails.add(email)
-            existing_ids.add(request_id)
+            requests_by_id[request_id] = data["requests"][-1]
             data["last_id"] = max(int(data.get("last_id", 0)), request_id)
             imported += 1
 
         if imported:
             self._write(data)
         return imported
+
+    def repair_orphan_device_requests(self) -> int:
+        data = self._read()
+        requests = data.get("requests") or []
+        by_id = {
+            int(item["id"]): item
+            for item in requests
+            if isinstance(item, dict) and str(item.get("id") or "").isdigit()
+        }
+        remove_indexes: set[int] = set()
+        repaired = 0
+        for index, request in enumerate(requests):
+            email = str(request.get("client_email") or "")
+            match = TG_CLIENT_EMAIL_RE.match(email)
+            if not match:
+                continue
+            real_request_id = int(match.group("request_id"))
+            current_id = int(request.get("id") or 0)
+            device_id = int(match.group("device_id") or 1)
+            if real_request_id == current_id or device_id <= 1:
+                continue
+            parent = by_id.get(real_request_id)
+            if not parent:
+                continue
+            devices = request_devices(parent)
+            if not any(str(device.get("client_email") or "") == email for device in devices):
+                devices.append(
+                    {
+                        "device_id": device_id,
+                        "name": f"Устройство {device_id}",
+                        "client_email": email,
+                        "uuid": str(request.get("uuid") or ""),
+                        "profile_type": str(request.get("profile_type") or parent.get("profile_type") or "default"),
+                        "created_at": str(request.get("decided_at") or request.get("created_at") or utc_now_iso()),
+                    }
+                )
+                parent["devices"] = sorted(devices, key=lambda item: int(item.get("device_id") or 0))
+            remove_indexes.add(index)
+            repaired += 1
+        if repaired:
+            data["requests"] = [item for index, item in enumerate(requests) if index not in remove_indexes]
+            self._write(data)
+        return repaired
 
     def update_user_info(self, chat_id: int, username: str, full_name: str) -> bool:
         data = self._read()
@@ -3694,6 +3766,12 @@ def main() -> None:
             logging.info("Restored %s VPN clients from Xray config", imported)
     except Exception:
         logging.exception("Could not restore VPN clients from Xray config")
+    try:
+        repaired = store.repair_orphan_device_requests()
+        if repaired:
+            logging.info("Repaired %s orphan device records", repaired)
+    except Exception:
+        logging.exception("Could not repair orphan device records")
     logging.info("VPN approval bot started; db_path=%s", config.db_path)
     offset = None
     last_sharing_check = 0.0
