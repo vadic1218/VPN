@@ -40,7 +40,7 @@ USAGE_STATS_JOURNAL_LINES = 5000
 XRAY_USAGE_RE = re.compile(
     r"from (?:tcp:)?(?P<ip>\d+\.\d+\.\d+\.\d+):\d+ accepted .* email: (?P<email>\S+)"
 )
-TG_CLIENT_EMAIL_RE = re.compile(r"^tg-(?P<chat_id>\d+)-(?P<request_id>\d+)$")
+TG_CLIENT_EMAIL_RE = re.compile(r"^tg-(?P<chat_id>\d+)-(?P<request_id>\d+)(?:-d(?P<device_id>\d+))?$")
 
 
 def default_db_path() -> Path:
@@ -315,6 +315,70 @@ def plan_info(plan_id: str | int | None) -> dict[str, int]:
 def plan_label(plan_id: str | int | None) -> str:
     plan = plan_info(plan_id)
     return f"{plan['devices']} устр. - {plan['price']} руб/мес"
+
+
+def device_label(device: dict[str, Any]) -> str:
+    name = str(device.get("name") or "").strip()
+    if name:
+        return name
+    device_id = int(device.get("device_id") or 1)
+    return f"Устройство {device_id}"
+
+
+def request_devices(row: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_devices = row.get("devices")
+    devices: list[dict[str, Any]] = []
+    if isinstance(raw_devices, list):
+        for item in raw_devices:
+            if not isinstance(item, dict):
+                continue
+            email = str(item.get("client_email") or "")
+            client_uuid = str(item.get("uuid") or "")
+            if not email or not client_uuid:
+                continue
+            device_id = int(item.get("device_id") or len(devices) + 1)
+            devices.append(
+                {
+                    "device_id": device_id,
+                    "name": str(item.get("name") or f"Устройство {device_id}"),
+                    "client_email": email,
+                    "uuid": client_uuid,
+                    "profile_type": str(item.get("profile_type") or row.get("profile_type") or "default"),
+                    "created_at": str(item.get("created_at") or row.get("decided_at") or row.get("created_at") or ""),
+                }
+            )
+    if devices:
+        return sorted(devices, key=lambda item: int(item.get("device_id") or 0))
+    email = str(row.get("client_email") or "")
+    client_uuid = str(row.get("uuid") or "")
+    if not email or not client_uuid:
+        return []
+    return [
+        {
+            "device_id": 1,
+            "name": "Устройство 1",
+            "client_email": email,
+            "uuid": client_uuid,
+            "profile_type": str(row.get("profile_type") or "default"),
+            "created_at": str(row.get("decided_at") or row.get("created_at") or ""),
+        }
+    ]
+
+
+def request_device_emails(row: dict[str, Any]) -> list[str]:
+    return [str(device.get("client_email") or "") for device in request_devices(row) if device.get("client_email")]
+
+
+def request_device_limit(row: dict[str, Any]) -> int:
+    return int(row.get("plan_devices") or plan_info(row.get("plan_id"))["devices"])
+
+
+def next_device_id(row: dict[str, Any]) -> int:
+    used = {int(device.get("device_id") or 0) for device in request_devices(row)}
+    candidate = 1
+    while candidate in used:
+        candidate += 1
+    return candidate
 
 
 def price_list_text() -> str:
@@ -743,6 +807,7 @@ class Store:
                 "plan_price": plan["price"],
                 "client_email": "",
                 "uuid": "",
+                "devices": [],
                 "created_at": now,
                 "decided_at": None,
             }
@@ -809,6 +874,16 @@ class Store:
                     "plan_price": 200,
                     "client_email": email,
                     "uuid": client_uuid,
+                    "devices": [
+                        {
+                            "device_id": int(match.group("device_id") or 1),
+                            "name": f"Устройство {int(match.group('device_id') or 1)}",
+                            "client_email": email,
+                            "uuid": client_uuid,
+                            "profile_type": "default",
+                            "created_at": now,
+                        }
+                    ],
                     "created_at": now,
                     "decided_at": now,
                     "subscription_status": "restored_no_deadline",
@@ -862,6 +937,16 @@ class Store:
                 if status == "approved":
                     request["subscription_status"] = "active"
                     request["subscription_until"] = subscription_until(subscription_days)
+                    request["devices"] = [
+                        {
+                            "device_id": 1,
+                            "name": "Устройство 1",
+                            "client_email": client_email,
+                            "uuid": client_uuid,
+                            "profile_type": profile_type,
+                            "created_at": now,
+                        }
+                    ]
                 self._write(data)
                 return
 
@@ -877,8 +962,71 @@ class Store:
                 request["decided_at"] = now
                 request.setdefault("subscription_status", "active")
                 request.setdefault("subscription_until", subscription_until(DEFAULT_SUBSCRIPTION_DAYS))
+                devices = request_devices(request)
+                if devices:
+                    devices[0].update(
+                        {
+                            "client_email": client_email,
+                            "uuid": client_uuid,
+                            "profile_type": profile_type,
+                            "created_at": now,
+                        }
+                    )
+                    request["devices"] = devices
+                else:
+                    request["devices"] = [
+                        {
+                            "device_id": 1,
+                            "name": "Устройство 1",
+                            "client_email": client_email,
+                            "uuid": client_uuid,
+                            "profile_type": profile_type,
+                            "created_at": now,
+                        }
+                    ]
                 self._write(data)
                 return
+
+    def add_device(self, request_id: int, device_id: int, device_name: str, profile_type: str, client_email: str, client_uuid: str) -> dict[str, Any] | None:
+        data = self._read()
+        now = utc_now_iso()
+        for request in data["requests"]:
+            if int(request["id"]) != request_id:
+                continue
+            devices = request_devices(request)
+            devices.append(
+                {
+                    "device_id": int(device_id),
+                    "name": device_name,
+                    "client_email": client_email,
+                    "uuid": client_uuid,
+                    "profile_type": profile_type,
+                    "created_at": now,
+                }
+            )
+            request["devices"] = sorted(devices, key=lambda item: int(item.get("device_id") or 0))
+            request["updated_at"] = now
+            self._write(data)
+            return request
+        return None
+
+    def prune_devices(self, request_id: int, keep_count: int) -> list[dict[str, Any]]:
+        data = self._read()
+        for request in data["requests"]:
+            if int(request["id"]) != request_id:
+                continue
+            devices = request_devices(request)
+            keep = devices[: max(1, int(keep_count))]
+            removed = devices[len(keep) :]
+            request["devices"] = keep
+            if keep:
+                request["client_email"] = str(keep[0]["client_email"])
+                request["uuid"] = str(keep[0]["uuid"])
+                request["profile_type"] = str(keep[0].get("profile_type") or request.get("profile_type") or "default")
+            request["updated_at"] = utc_now_iso()
+            self._write(data)
+            return removed
+        return []
 
     def disable_request(self, request_id: int) -> None:
         now = utc_now_iso()
@@ -1116,8 +1264,8 @@ class Store:
         for request in self.list_approved_requests():
             if request.get("is_free"):
                 continue
-            email = str(request.get("client_email") or "")
-            seen_at = parse_iso_time(last_seen.get(email, ""))
+            seen_values = [last_seen.get(email, "") for email in request_device_emails(request)]
+            seen_at = max((parse_iso_time(value) for value in seen_values if parse_iso_time(value)), default=None)
             if not seen_at:
                 continue
             if seen_at.tzinfo is None:
@@ -1863,6 +2011,8 @@ def subscription_actions_markup(request_id: int) -> str:
     return json.dumps(
         {
             "inline_keyboard": [
+                [{"text": "Мои устройства", "callback_data": "show_devices"}],
+                [{"text": "Добавить устройство", "callback_data": "add_device"}],
                 [{"text": "Перевыпустить ссылку", "callback_data": f"show_reissue:{request_id}"}],
                 [{"text": "Сменить тариф", "callback_data": "show_change_plan"}],
                 [{"text": "Маршрутизация Happ", "callback_data": "send_routing"}],
@@ -1896,6 +2046,9 @@ def admin_reissue_request_markup(request_id: int, profile_type: str) -> str:
 def admin_client_markup(row: dict[str, Any]) -> str:
     request_id = int(row["id"])
     rows = [
+        [
+            {"text": "Устройства", "callback_data": f"client_devices:{request_id}"},
+        ],
         [
             {"text": "Продление", "callback_data": f"client_extend:{request_id}"},
             {"text": "Тариф", "callback_data": f"client_plan:{request_id}"},
@@ -2038,12 +2191,15 @@ def format_client_list(rows: list[dict[str, Any]], last_seen: dict[str, str]) ->
     lines = [f"Платные клиенты VPN: {len(rows)}"]
     for number, row in enumerate(rows, start=1):
         profile_type = profile_label(str(row.get("profile_type") or "default"))
-        email = str(row.get("client_email") or "")
+        emails = request_device_emails(row)
+        latest_seen = max((last_seen.get(email, "") for email in emails), default="")
         username = format_username(str(row.get("username") or ""))
         subscription = subscription_display(row)
         plan = plan_label(row.get("plan_id"))
+        devices_count = len(request_devices(row))
+        devices_limit = request_device_limit(row)
         lines.append(
-            f"{number}. {username} | {profile_type} | тариф: {plan} | подписка: {subscription} | активность: {format_age(last_seen.get(email))}"
+            f"{number}. {username} | {profile_type} | устройств: {devices_count}/{devices_limit} | тариф: {plan} | подписка: {subscription} | активность: {format_age(latest_seen)}"
         )
     return "\n".join(lines)
 
@@ -2051,6 +2207,8 @@ def format_client_list(rows: list[dict[str, Any]], last_seen: dict[str, str]) ->
 def format_client_card(row: dict[str, Any], last_seen: dict[str, str], number: int) -> str:
     profile_type = profile_label(str(row.get("profile_type") or "default"))
     email = str(row.get("client_email") or "")
+    emails = request_device_emails(row)
+    latest_seen = max((last_seen.get(item, "") for item in emails), default=last_seen.get(email, ""))
     username = format_username(str(row.get("username") or ""))
     full_name = str(row.get("full_name") or "-")
     chat_id = str(row.get("chat_id") or "-")
@@ -2059,15 +2217,18 @@ def format_client_card(row: dict[str, Any], last_seen: dict[str, str], number: i
     subscription_text = subscription_display(row)
     free_text = "да" if row.get("is_free") else "нет"
     plan = plan_label(row.get("plan_id"))
+    devices_count = len(request_devices(row))
+    devices_limit = request_device_limit(row)
     return (
         f"Клиент #{number} | профиль #{row.get('id')}\n"
         f"{username} | {full_name}\n\n"
         f"Статус: {status}\n"
         f"Подписка: {subscription_status}, {subscription_text}\n"
         f"Тариф: {plan}\n"
+        f"Устройства: {devices_count}/{devices_limit}\n"
         f"Оператор: {profile_type}\n"
         f"Бесплатный: {free_text}\n"
-        f"Активность: {format_age(last_seen.get(email))}\n"
+        f"Активность: {format_age(latest_seen)}\n"
         f"Chat ID: {chat_id}\n"
         f"Профиль в Xray: {email or '-'}"
     )
@@ -2086,6 +2247,31 @@ def format_client_details(row: dict[str, Any], last_seen: dict[str, str]) -> str
         f"Одобрен/обновлён: {decided_at} ({format_age(decided_at)})\n"
         f"Восстановлен из Xray: {restored}"
     )
+
+
+def format_devices_text(row: dict[str, Any], config: Config, include_links: bool = True) -> str:
+    devices = request_devices(row)
+    limit = request_device_limit(row)
+    lines = [
+        f"Устройства профиля #{row.get('id')}: {len(devices)}/{limit}",
+        "",
+        "Каждое устройство получает отдельную VPN-ссылку. Так лимит считается по устройствам, а не по Wi-Fi.",
+    ]
+    if not devices:
+        lines.append("")
+        lines.append("Устройств пока нет.")
+        return "\n".join(lines)
+    for device in devices:
+        device_id = int(device.get("device_id") or 1)
+        profile_type = str(device.get("profile_type") or row.get("profile_type") or "default")
+        label = f"VPN {row.get('id')} D{device_id} {profile_short(profile_type)}"
+        lines.append("")
+        lines.append(f"{device_id}. {device_label(device)}")
+        lines.append(f"Оператор: {profile_label(profile_type)}")
+        lines.append(f"Создано: {format_age(str(device.get('created_at') or ''))}")
+        if include_links:
+            lines.append(build_vless_link(config, str(device["uuid"]), profile_type, label))
+    return "\n".join(lines)
 
 
 def user_display(user: dict[str, Any]) -> tuple[str, str]:
@@ -2151,10 +2337,21 @@ def send_admin_result(bot: TelegramBot, admin_chat_id: int, user_chat_id: int, u
     bot.send_message(admin_chat_id, admin_text)
 
 
+def enforce_device_limit(manager: XrayManager, store: Store, row: dict[str, Any]) -> list[dict[str, Any]]:
+    limit = request_device_limit(row)
+    devices = request_devices(row)
+    if len(devices) <= limit:
+        return []
+    removed = devices[limit:]
+    for device in removed:
+        manager.remove_client(str(device["client_email"]))
+    return store.prune_devices(int(row["id"]), limit)
+
+
 def send_client_card(bot: TelegramBot, manager: XrayManager, chat_id: int, row: dict[str, Any], markup: str | None = None) -> None:
-    email = str(row.get("client_email") or "")
+    emails = request_device_emails(row)
     try:
-        last_seen = manager.get_last_seen_by_email([email]) if email else {}
+        last_seen = manager.get_last_seen_by_email(emails) if emails else {}
     except Exception:
         logging.exception("Could not load single client activity")
         last_seen = {}
@@ -2402,6 +2599,10 @@ def handle_message(
             "2. Выбери тариф и оператора. Если не знаешь оператора, выбирай «Обычный оператор».\n"
             "3. После одобрения бот пришлёт VPN-ссылку.\n"
             "4. Открой ссылку в Happ и нажми подключить.\n\n"
+            "Устройства:\n"
+            "1. Одна VPN-ссылка = одно устройство.\n"
+            "2. Для телефона, ноутбука и планшета нужны отдельные ссылки.\n"
+            "3. Добавить ссылку можно в «Моя подписка» -> «Добавить устройство».\n\n"
             "Маршрутизация:\n"
             "1. Нажми «Моя подписка».\n"
             "2. Нажми кнопку маршрутизации Happ.\n"
@@ -2453,7 +2654,8 @@ def handle_message(
             return
         if row.get("status") == "expired" and row.get("client_email") and row.get("uuid"):
             try:
-                manager.save_client(str(row["client_email"]), str(row["uuid"]))
+                for device in request_devices(row):
+                    manager.save_client(str(device["client_email"]), str(device["uuid"]))
             except Exception as exc:
                 logging.exception("Failed to restore expired VPN profile for exact-date extension")
                 bot.send_message(chat_id, f"Не смог включить просроченный профиль #{request_id}: {exc}")
@@ -2485,7 +2687,7 @@ def handle_message(
                 logging.exception("Failed to restore clients from Xray")
         rows = refresh_missing_user_info(bot, store, rows)
         try:
-            last_seen = manager.get_last_seen_by_email([str(row["client_email"]) for row in rows])
+            last_seen = manager.get_last_seen_by_email([email for row in rows for email in request_device_emails(row)])
         except Exception as exc:
             logging.exception("Failed to load client activity")
             error_text = str(exc)
@@ -2511,7 +2713,7 @@ def handle_message(
         clear_previous_admin_list_messages(bot, store, chat_id)
         rows = refresh_missing_user_info(bot, store, store.list_free_requests())
         try:
-            last_seen = manager.get_last_seen_by_email([str(row["client_email"]) for row in rows])
+            last_seen = manager.get_last_seen_by_email([email for row in rows for email in request_device_emails(row)])
         except Exception:
             logging.exception("Failed to load free client activity")
             last_seen = {}
@@ -2564,6 +2766,7 @@ def handle_message(
             f"Твоя VPN-подписка: {subscription_display(existing)}.\n"
             f"Профиль: #{existing['id']}, {profile_label(str(existing.get('profile_type') or 'default'))}.\n"
             f"Тариф: {plan_label(existing.get('plan_id'))}.\n"
+            f"Устройства: {len(request_devices(existing))}/{request_device_limit(existing)}.\n"
             f"Статус заявки: {existing['status']}.\n\n"
             f"{price_list_text()}",
             subscription_actions_markup(int(existing["id"])),
@@ -2578,6 +2781,7 @@ def handle_message(
                 f"Твоя VPN-подписка: {subscription_display(existing)}.\n"
                 f"Профиль: #{existing['id']}, {profile_label(str(existing.get('profile_type') or 'default'))}.\n"
                 f"Тариф: {plan_label(existing.get('plan_id'))}.\n"
+                f"Устройства: {len(request_devices(existing))}/{request_device_limit(existing)}.\n"
                 f"Статус заявки: {existing['status']}.\n\n"
                 f"{price_list_text()}",
                 subscription_actions_markup(int(existing["id"])),
@@ -2633,7 +2837,9 @@ def handle_message(
                 bot.send_message(
                     chat_id,
                     "У тебя уже есть активный VPN-профиль. Новую заявку создавать нельзя.\n\n"
-                    "Твоя ссылка:\n\n" + link,
+                    f"Устройства: {len(request_devices(existing))}/{request_device_limit(existing)}.\n"
+                    "Чтобы добавить ещё устройство, открой «Моя подписка» -> «Добавить устройство».\n\n"
+                    "Основная ссылка:\n\n" + link,
                 )
                 return
         bot.send_message(
@@ -2697,6 +2903,59 @@ def handle_callback(
     if parts[0] == "send_routing":
         bot.answer_callback_query(callback_id, "Отправляю правила.")
         send_routing_instructions(bot, config, user_chat_id)
+        return
+
+    if parts[0] == "show_devices":
+        existing = store.get_active_request_by_chat_id(user_chat_id)
+        if not existing or existing.get("status") != "approved":
+            bot.answer_callback_query(callback_id, "Активный профиль не найден.")
+            return
+        bot.answer_callback_query(callback_id, "Показываю устройства.")
+        bot.send_message(user_chat_id, format_devices_text(existing, config), subscription_actions_markup(int(existing["id"])))
+        return
+
+    if parts[0] == "add_device":
+        existing = store.get_active_request_by_chat_id(user_chat_id)
+        if not existing or existing.get("status") != "approved":
+            bot.answer_callback_query(callback_id, "Активный профиль не найден.")
+            return
+        devices = request_devices(existing)
+        limit = request_device_limit(existing)
+        if len(devices) >= limit:
+            bot.answer_callback_query(callback_id, "Лимит устройств уже достигнут.")
+            bot.send_message(
+                user_chat_id,
+                f"По твоему тарифу доступно устройств: {limit}. Сейчас уже создано: {len(devices)}.\n\n"
+                "Чтобы добавить ещё устройство, нажми «Сменить тариф».",
+                subscription_actions_markup(int(existing["id"])),
+            )
+            return
+        request_id = int(existing["id"])
+        device_id = next_device_id(existing)
+        profile_type = str(existing.get("profile_type") or "default")
+        client_email = f"tg-{existing['chat_id']}-{request_id}-d{device_id}"
+        client_uuid = str(uuid.uuid4())
+        device_name = f"Устройство {device_id}"
+        label = f"VPN {request_id} D{device_id} {profile_short(profile_type)}"
+        link = build_vless_link(config, client_uuid, profile_type, label)
+        bot.safe_answer_callback_query(callback_id, "Создаю устройство...")
+        try:
+            manager.save_client(client_email, client_uuid)
+        except Exception as exc:
+            logging.exception("Failed to add VPN device")
+            bot.send_message(user_chat_id, f"Не смог добавить устройство: {exc}", subscription_actions_markup(request_id))
+            return
+        updated = store.add_device(request_id, device_id, device_name, profile_type, client_email, client_uuid)
+        if not updated:
+            bot.send_message(user_chat_id, "Устройство создано на сервере, но не смог сохранить его в базе. Напиши админу.", subscription_actions_markup(request_id))
+            return
+        bot.send_message(
+            user_chat_id,
+            f"Готово. Добавлено {device_name}.\n\n"
+            "Эту ссылку ставь только на одно устройство:\n\n"
+            + link,
+            subscription_actions_markup(request_id),
+        )
         return
 
     if parts[0] == "show_change_plan":
@@ -2949,6 +3208,16 @@ def handle_callback(
         bot.send_message(user_chat_id, f"{title} для профиля #{request_id}", markup)
         return
 
+    if parts[0] == "client_devices" and len(parts) == 2 and parts[1].isdigit():
+        request_id = int(parts[1])
+        row = store.get_request(request_id)
+        if not row:
+            bot.answer_callback_query(callback_id, "Профиль не найден.")
+            return
+        bot.answer_callback_query(callback_id, "Устройства клиента.")
+        bot.send_message(user_chat_id, format_devices_text(row, config, include_links=False), admin_client_markup(row))
+        return
+
     if parts[0] == "client_stats" and len(parts) == 2 and parts[1].isdigit():
         request_id = int(parts[1])
         row = store.get_request(request_id)
@@ -2958,9 +3227,9 @@ def handle_callback(
         bot.safe_answer_callback_query(callback_id, "Собираю статистику...")
         try:
             all_emails = [
-                str(item.get("client_email") or "")
+                email
                 for item in store.list_approved_requests()
-                if item.get("client_email")
+                for email in request_device_emails(item)
             ]
             stats = manager.get_usage_stats(str(row["client_email"]), all_emails)
             bot.send_message(user_chat_id, format_usage_stats(row, stats), admin_client_markup(row))
@@ -3015,13 +3284,20 @@ def handle_callback(
         if not updated:
             bot.answer_callback_query(callback_id, "Не смог сменить тариф.")
             return
+        removed_devices: list[dict[str, Any]] = []
+        try:
+            removed_devices = enforce_device_limit(manager, store, updated)
+        except Exception as exc:
+            logging.exception("Could not enforce device limit after admin plan change")
+            bot.send_message(user_chat_id, f"Тариф изменён, но не смог отключить лишние устройства: {exc}")
         bot.answer_callback_query(callback_id, "Тариф изменён.")
+        extra_text = f" Отключено лишних устройств: {len(removed_devices)}." if removed_devices else ""
         send_admin_result(
             bot,
             user_chat_id,
             int(updated["chat_id"]),
-            f"Тариф VPN-профиля #{request_id} изменён админом: {old_plan} -> {new_plan}. Ссылка осталась прежней.",
-            f"Готово. Тариф профиля #{request_id} изменён: {old_plan} -> {new_plan}.",
+            f"Тариф VPN-профиля #{request_id} изменён админом: {old_plan} -> {new_plan}.{extra_text}",
+            f"Готово. Тариф профиля #{request_id} изменён: {old_plan} -> {new_plan}.{extra_text}",
         )
         return
 
@@ -3041,13 +3317,20 @@ def handle_callback(
         if not updated:
             bot.answer_callback_query(callback_id, "Не смог сменить тариф.")
             return
+        removed_devices: list[dict[str, Any]] = []
+        try:
+            removed_devices = enforce_device_limit(manager, store, updated)
+        except Exception as exc:
+            logging.exception("Could not enforce device limit after plan approval")
+            bot.send_message(user_chat_id, f"Тариф изменён, но не смог отключить лишние устройства: {exc}")
         bot.answer_callback_query(callback_id, "Тариф изменён.")
+        extra_text = f" Отключено лишних устройств: {len(removed_devices)}." if removed_devices else ""
         send_admin_result(
             bot,
             user_chat_id,
             int(updated["chat_id"]),
-            f"Тариф VPN-профиля #{request_id} изменён: {old_plan} -> {new_plan}. Ссылка осталась прежней.",
-            f"Готово. Тариф профиля #{request_id} изменён: {old_plan} -> {new_plan}.",
+            f"Тариф VPN-профиля #{request_id} изменён: {old_plan} -> {new_plan}.{extra_text}",
+            f"Готово. Тариф профиля #{request_id} изменён: {old_plan} -> {new_plan}.{extra_text}",
         )
         return
 
@@ -3107,10 +3390,11 @@ def handle_callback(
             bot.answer_callback_query(callback_id, "Активный профиль не найден.")
             return
 
-        client_email = str(row["client_email"])
+        client_emails = request_device_emails(row)
         bot.safe_answer_callback_query(callback_id, "Отключаю пользователя...")
         try:
-            manager.remove_client(client_email)
+            for client_email in client_emails:
+                manager.remove_client(client_email)
         except Exception as exc:
             logging.exception("Failed to disable VPN profile")
             bot.send_message(user_chat_id, f"Не смог отключить профиль #{request_id}: {exc}")
@@ -3133,7 +3417,8 @@ def handle_callback(
             return
         if row.get("status") == "expired":
             try:
-                manager.save_client(str(row["client_email"]), str(row["uuid"]))
+                for device in request_devices(row):
+                    manager.save_client(str(device["client_email"]), str(device["uuid"]))
             except Exception as exc:
                 logging.exception("Failed to restore expired VPN profile")
                 bot.send_message(user_chat_id, f"Не смог включить просроченный профиль #{request_id}: {exc}")
@@ -3238,7 +3523,9 @@ def handle_callback(
             bot,
             user_chat_id,
             int(row["chat_id"]),
-            f"Заявка одобрена. Тариф: {selected_plan_label}. Подписка: {subscription_text}.\n\nТвоя VPN-ссылка:\n\n" + link,
+            f"Заявка одобрена. Тариф: {selected_plan_label}. Подписка: {subscription_text}.\n"
+            "Создано Устройство 1. Если по тарифу доступно больше устройств, открой «Моя подписка» -> «Добавить устройство».\n\n"
+            "Твоя VPN-ссылка:\n\n" + link,
             f"Готово. Заявка #{request_id} одобрена как {profile_label(profile_type)}. Тариф: {selected_plan_label}. Подписка: {subscription_text}.",
         )
         send_routing_instructions(bot, config, int(row["chat_id"]))
@@ -3246,29 +3533,34 @@ def handle_callback(
 
 def check_sharing_alerts(bot: TelegramBot, store: Store, config: Config, manager: XrayManager) -> None:
     rows = store.list_approved_requests()
-    email_to_row = {str(row.get("client_email") or ""): row for row in rows if row.get("client_email")}
+    email_to_row: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+    for row in rows:
+        for device in request_devices(row):
+            email = str(device.get("client_email") or "")
+            if email:
+                email_to_row[email] = (row, device)
     if not email_to_row:
         return
 
     recent_ips = manager.get_recent_ips_by_email(list(email_to_row), SHARING_LOOKBACK_MINUTES)
     for email, ips in recent_ips.items():
-        row = email_to_row[email]
-        allowed_devices = int(row.get("plan_devices") or plan_info(row.get("plan_id"))["devices"])
-        alert_ip_limit = allowed_devices + SHARING_IP_GRACE
+        row, device = email_to_row[email]
+        alert_ip_limit = 1 + SHARING_IP_GRACE
         if len(ips) <= alert_ip_limit or not store.should_send_sharing_alert(email):
             continue
         request_id = int(row["id"])
         username = str(row.get("username") or "-")
-        profile_type = str(row.get("profile_type") or "default")
+        profile_type = str(device.get("profile_type") or row.get("profile_type") or "default")
         plan = plan_label(row.get("plan_id"))
         ip_list = ", ".join(sorted(ips))
         text = (
             f"Подозрение на шаринг VPN #{request_id}\n"
             f"Пользователь: @{username}\n"
+            f"Устройство: {device_label(device)}\n"
             f"Тип: {profile_label(profile_type)}\n"
             f"Тариф: {plan}\n"
-            f"Лимит устройств: {allowed_devices}\n"
-            f"За последние {SHARING_LOOKBACK_MINUTES} мин один профиль был с разных IP:\n"
+            f"Лимит: одна ссылка = одно устройство\n"
+            f"За последние {SHARING_LOOKBACK_MINUTES} мин одна ссылка была с разных IP:\n"
             f"{ip_list}\n\n"
             "Это может быть пересланная ссылка. Проверь и выбери действие."
         )
@@ -3295,17 +3587,18 @@ def check_expired_subscriptions(bot: TelegramBot, store: Store, config: Config, 
 
     for row in store.find_expired_requests():
         request_id = int(row["id"])
-        client_email = str(row.get("client_email") or "")
-        if not client_email:
+        client_emails = request_device_emails(row)
+        if not client_emails:
             continue
         try:
-            manager.remove_client(client_email)
+            for client_email in client_emails:
+                manager.remove_client(client_email)
         except Exception:
             logging.exception("Failed to disable expired VPN profile #%s", request_id)
             continue
         store.expire_request(request_id)
         username = format_username(str(row.get("username") or ""))
-        text = f"Подписка профиля #{request_id} истекла. VPN-ссылка отключена."
+        text = f"Подписка профиля #{request_id} истекла. VPN-ссылки устройств отключены."
         bot.send_message(int(row["chat_id"]), text)
         for admin_chat_id in config.admin_chat_ids:
             bot.send_message(admin_chat_id, f"{text}\nПользователь: {username}\nChat ID: {row['chat_id']}")
@@ -3313,7 +3606,7 @@ def check_expired_subscriptions(bot: TelegramBot, store: Store, config: Config, 
 
 def check_inactive_clients(bot: TelegramBot, store: Store, config: Config, manager: XrayManager) -> None:
     rows = store.list_approved_requests()
-    emails = [str(row.get("client_email") or "") for row in rows if row.get("client_email")]
+    emails = [email for row in rows for email in request_device_emails(row)]
     if not emails:
         return
     last_seen = manager.get_last_seen_by_email(emails)

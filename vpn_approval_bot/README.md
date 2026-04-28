@@ -40,6 +40,17 @@ Routing mode:
 
 This reduces bank login errors, captchas, and slow loading for local services while keeping TikTok routed through VPN.
 
+## Device Profiles
+
+The bot counts devices by separate Xray/VLESS profiles, not by Wi-Fi or IP address.
+
+- One VPN link is intended for one device.
+- The first approved link becomes `Устройство 1`.
+- Users can press `Моя подписка` -> `Добавить устройство` to create more device links up to their tariff limit.
+- Each added device gets its own UUID and Xray email like `tg-CHAT-REQUEST-d2`.
+- If a tariff is downgraded below the current device count, extra device links are removed from Xray and stop working.
+- Sharing detection now checks each device link separately. One device link appearing from several IPs can trigger a sharing warning.
+
 ## Admin Features
 
 Admins get a persistent `Список клиентов` button. It shows paid approved profiles, selected operator profile, creation time, and how long ago each client was last seen in Xray logs. Free users are intentionally excluded from this list and shown only in `Бесплатные клиенты`.
