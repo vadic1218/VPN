@@ -1795,6 +1795,37 @@ fi
         finally:
             client.close()
 
+    def ensure_profile_guard_enabled(self) -> dict[str, str]:
+        client = self._connect()
+        try:
+            command = r"""
+systemctl unmask xray-profile-guard >/dev/null 2>&1 || true
+cat >/etc/systemd/system/xray-profile-guard.service <<'EOF'
+[Unit]
+Description=Xray profile one-device guard
+After=xray.service
+Requires=xray.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/xray-profile-guard.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable --now xray-profile-guard
+systemctl is-active xray-profile-guard
+"""
+            rc, out, err = self._run(client, command)
+            if rc != 0:
+                raise RuntimeError(f"Profile guard enable failed: {out}{err}")
+            return {"guard": out.strip() or "unknown"}
+        finally:
+            client.close()
+
         tracked_emails = set(all_client_emails or [])
         hits = 0
         total_tracked_hits = 0
@@ -1839,6 +1870,7 @@ fi
             commands = {
                 "xray": "systemctl is-active xray || true",
                 "guard": "systemctl is-active xray-profile-guard 2>/dev/null || true",
+                "guard_enabled": "systemctl is-enabled xray-profile-guard 2>/dev/null || true",
                 "ports": "ss -lnt '( sport = :443 or sport = :8443 or sport = :2053 )' | tail -n +2 || true",
                 "uptime": "uptime -p || true",
                 "load": "cat /proc/loadavg || true",
@@ -2466,7 +2498,7 @@ def format_vpn_status(status: dict[str, Any], config: Config) -> str:
         "Состояние VPN-сервера\n\n"
         "Службы:\n"
         f"- Xray: {service_status_ru(status.get('xray'))}\n"
-        f"- защита профилей: {service_status_ru(status.get('guard'))}\n"
+        f"- защита профилей: {service_status_ru(status.get('guard'))} ({status.get('guard_enabled') or 'неизвестно'})\n"
         f"- время работы: {uptime_ru(status.get('uptime'))}\n"
         f"- резервный хост: {reserve}\n\n"
         "Ресурсы сервера:\n"
@@ -3467,6 +3499,7 @@ def handle_callback(
         )
         try:
             manager.save_client(client_email, client_uuid)
+            manager.reset_profile_guard_binding(client_email)
         except Exception as exc:
             logging.exception("Failed to reissue VPN profile")
             bot.safe_answer_callback_query(callback_id, "Ошибка, конфиг не изменён или откатан.")
@@ -3638,6 +3671,11 @@ def main() -> None:
     store = Store(config.db_path)
     bot = TelegramBot(config.telegram_token)
     manager = XrayManager(config)
+    try:
+        guard_status = manager.ensure_profile_guard_enabled()
+        logging.info("Profile guard enabled: %s", guard_status.get("guard"))
+    except Exception:
+        logging.exception("Could not enable profile guard")
     remote_state_checked = False
     try:
         remote_state = manager.load_state_backup()
