@@ -28,6 +28,18 @@ The bot supports these profile types:
 
 Old profiles with `default` and `mts` remain valid.
 
+## Happ Routing
+
+The bot can send a Happ routing QR/link from `Моя подписка` or `/routing`.
+
+Routing mode:
+
+- TikTok and its CDN domains go through VPN.
+- Russian services go directly, bypassing VPN.
+- The direct whitelist includes `.ru`, `.рф`, banks, Yandex, VK, Gosuslugi, government sites, operators, marketplaces, maps, delivery services, Russian media, Apple/Google connectivity checks, and common captcha domains.
+
+This reduces bank login errors, captchas, and slow loading for local services while keeping TikTok routed through VPN.
+
 ## Admin Features
 
 Admins get a persistent `Список клиентов` button. It shows paid approved profiles, selected operator profile, creation time, and how long ago each client was last seen in Xray logs. Free users are intentionally excluded from this list and shown only in `Бесплатные клиенты`.
