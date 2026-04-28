@@ -1082,6 +1082,30 @@ class Store:
             return request
         return None
 
+    def update_device(self, request_id: int, device_id: int, client_uuid: str, profile_type: str | None = None) -> dict[str, Any] | None:
+        data = self._read()
+        now = utc_now_iso()
+        for request in data["requests"]:
+            if int(request["id"]) != request_id:
+                continue
+            devices = request_devices(request)
+            for device in devices:
+                if int(device.get("device_id") or 0) != int(device_id):
+                    continue
+                if profile_type:
+                    device["profile_type"] = profile_type
+                device["uuid"] = client_uuid
+                device["updated_at"] = now
+                if int(device_id) == 1:
+                    request["uuid"] = client_uuid
+                    request["client_email"] = str(device["client_email"])
+                    request["profile_type"] = str(device.get("profile_type") or request.get("profile_type") or "default")
+                request["devices"] = sorted(devices, key=lambda item: int(item.get("device_id") or 0))
+                request["updated_at"] = now
+                self._write(data)
+                return request
+        return None
+
     def prune_devices(self, request_id: int, keep_count: int) -> list[dict[str, Any]]:
         data = self._read()
         for request in data["requests"]:
@@ -2117,7 +2141,7 @@ def subscription_actions_markup(request_id: int) -> str:
             "inline_keyboard": [
                 [{"text": "Мои устройства", "callback_data": "show_devices"}],
                 [{"text": "Добавить устройство", "callback_data": "add_device"}],
-                [{"text": "Перевыпустить ссылку", "callback_data": f"show_reissue:{request_id}"}],
+                [{"text": "Перевыпустить основную ссылку", "callback_data": f"show_reissue:{request_id}"}],
                 [{"text": "Сменить тариф", "callback_data": "show_change_plan"}],
                 [{"text": "Маршрутизация Happ", "callback_data": "send_routing"}],
             ]
@@ -2131,6 +2155,17 @@ def reissue_choice_markup(request_id: int) -> str:
         {"inline_keyboard": profile_button_rows("reissue_request", request_id)},
         ensure_ascii=False,
     )
+
+
+def user_devices_markup(row: dict[str, Any]) -> str:
+    request_id = int(row["id"])
+    rows = [
+        [{"text": f"Перевыпустить ссылку: {device_label(device)}", "callback_data": f"reissue_device:{request_id}:{int(device.get('device_id') or 1)}"}]
+        for device in request_devices(row)
+    ]
+    rows.append([{"text": "Добавить устройство", "callback_data": "add_device"}])
+    rows.append([{"text": "Назад к подписке", "callback_data": "show_subscription"}])
+    return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
 
 
 def admin_reissue_request_markup(request_id: int, profile_type: str) -> str:
@@ -2360,6 +2395,7 @@ def format_devices_text(row: dict[str, Any], config: Config, include_links: bool
         f"Устройства профиля #{row.get('id')}: {len(devices)}/{limit}",
         "",
         "Каждое устройство получает отдельную VPN-ссылку. Так лимит считается по устройствам, а не по Wi-Fi.",
+        "Чтобы заменить одну ссылку, нажми кнопку перевыпуска нужного устройства под этим сообщением.",
     ]
     if not devices:
         lines.append("")
@@ -3015,7 +3051,23 @@ def handle_callback(
             bot.answer_callback_query(callback_id, "Активный профиль не найден.")
             return
         bot.answer_callback_query(callback_id, "Показываю устройства.")
-        bot.send_message(user_chat_id, format_devices_text(existing, config), subscription_actions_markup(int(existing["id"])))
+        bot.send_message(user_chat_id, format_devices_text(existing, config), user_devices_markup(existing))
+        return
+
+    if parts[0] == "show_subscription":
+        existing = store.get_active_request_by_chat_id(user_chat_id)
+        if not existing or existing.get("status") != "approved":
+            bot.answer_callback_query(callback_id, "Активный профиль не найден.")
+            return
+        bot.answer_callback_query(callback_id, "Моя подписка.")
+        bot.send_message(
+            user_chat_id,
+            f"Твоя VPN-подписка: {subscription_display(existing)}.\n"
+            f"Профиль: #{existing['id']}, {profile_label(str(existing.get('profile_type') or 'default'))}.\n"
+            f"Тариф: {plan_label(existing.get('plan_id'))}.\n"
+            f"Устройства: {len(request_devices(existing))}/{request_device_limit(existing)}.",
+            subscription_actions_markup(int(existing["id"])),
+        )
         return
 
     if parts[0] == "add_device":
@@ -3058,7 +3110,45 @@ def handle_callback(
             f"Готово. Добавлено {device_name}.\n\n"
             "Эту ссылку ставь только на одно устройство:\n\n"
             + link,
-            subscription_actions_markup(request_id),
+            user_devices_markup(updated),
+        )
+        return
+
+    if parts[0] == "reissue_device" and len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
+        request_id = int(parts[1])
+        device_id = int(parts[2])
+        row = store.get_request(request_id)
+        if not row or int(row.get("chat_id") or 0) != user_chat_id or row.get("status") != "approved":
+            bot.answer_callback_query(callback_id, "Активный профиль не найден.")
+            return
+        device = next((item for item in request_devices(row) if int(item.get("device_id") or 0) == device_id), None)
+        if not device:
+            bot.answer_callback_query(callback_id, "Устройство не найдено.")
+            return
+        profile_type = str(device.get("profile_type") or row.get("profile_type") or "default")
+        client_email = str(device["client_email"])
+        client_uuid = str(uuid.uuid4())
+        label = f"VPN {request_id} D{device_id} {profile_short(profile_type)}"
+        link = build_vless_link(config, client_uuid, profile_type, label)
+        bot.safe_answer_callback_query(callback_id, "Перевыпускаю устройство...")
+        try:
+            manager.save_client(client_email, client_uuid)
+            manager.reset_profile_guard_binding(client_email)
+        except Exception as exc:
+            logging.exception("Failed to reissue VPN device")
+            bot.send_message(user_chat_id, f"Не смог перевыпустить {device_label(device)}: {exc}", user_devices_markup(row))
+            return
+        updated = store.update_device(request_id, device_id, client_uuid, profile_type)
+        if not updated:
+            bot.send_message(user_chat_id, "Ссылка обновлена на сервере, но не смог сохранить её в базе. Напиши админу.", user_devices_markup(row))
+            return
+        bot.send_message(
+            user_chat_id,
+            f"Готово. Ссылка для {device_label(device)} перевыпущена.\n"
+            "Старая ссылка этого устройства больше не работает.\n\n"
+            "Новая VPN-ссылка:\n\n"
+            + link,
+            user_devices_markup(updated),
         )
         return
 
