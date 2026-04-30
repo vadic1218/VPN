@@ -73,6 +73,18 @@ Admins can run `/check_vpn`, press `Проверить VPN`, or press `Ресу�
 
 Client cards have a `Статистика` section. It shows grouped per-profile activity in Telegram: recent connection count, share of total VPN activity, active profiles in the log sample, unique IP count, first seen time, and last seen time. Xray does not expose exact CPU/RAM per user in this setup, so per-user resource usage is represented by real profile activity from Xray logs.
 
+## Admin Web Panel
+
+The same Python process can serve a protected admin site at `/admin` when Railway provides `PORT`.
+
+Set `ADMIN_WEB_TOKEN` to a long private password. Open:
+
+```text
+https://your-railway-domain.up.railway.app/admin
+```
+
+The web panel supports the same core admin actions as Telegram: paid clients, free clients, pending requests, client cards, device summaries, subscription extension, tariff changes, plan-change approval/rejection, operator reissue, free access toggle, full disable, per-client activity stats, and server resource status. The panel uses the same `DB_PATH`, remote backup, Xray SSH settings, and Telegram bot token as the bot.
+
 Xray config writes are serialized with a remote lock before the bot adds, reissues, or disables a profile. This prevents overlapping approvals from corrupting the config or stacking multiple Xray restarts. The current server does not expose the Xray API, so profile add/remove operations can still cause a short reconnect while Xray restarts; fully zero-drop provisioning requires enabling the Xray API in a separate migration.
 
 The bot also watches recent Xray logs for soft sharing detection. If one approved profile appears from two or more different IPs within the recent activity window, admins receive a warning with `Отключить`, `Перевыпустить`, and `Игнорировать` actions. The bot does not auto-block users from this check.
@@ -143,6 +155,7 @@ PAYMENT_TBANK_LINK
 PAYMENT_RECIPIENT
 PAYMENT_BANKS
 PUBLIC_BASE_URL
+ADMIN_WEB_TOKEN
 ```
 
 Recommended Railway values:
@@ -166,6 +179,7 @@ PAYMENT_QR_URL=
 PAYMENT_RECIPIENT=Вадим
 PAYMENT_BANKS=Сбер / Т-Банк
 PUBLIC_BASE_URL=https://your-railway-domain.up.railway.app
+ADMIN_WEB_TOKEN=put-a-long-random-password-here
 ```
 
 If you use `DB_PATH=/data/vpn_approval.json`, attach a Railway volume mounted at `/data` so requests and clients survive restarts.

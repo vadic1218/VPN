@@ -11,13 +11,14 @@ import uuid
 from base64 import b64encode
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from hmac import compare_digest
 from html import escape
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 import paramiko
@@ -76,6 +77,7 @@ class Config:
     remote_state_path: str
     public_base_url: str
     web_port: int
+    admin_web_token: str
     reserve_vpn_host: str
 
 
@@ -149,17 +151,70 @@ HAPP_ROUTING_DIRECT_SITES = [
     "domain:cdnvideo.ru",
     "domain:cdnvideo.net",
     "domain:ozon.ru",
+    "domain:ozon.by",
+    "domain:ozon.com",
+    "domain:ozon.travel",
+    "domain:ozonbank.ru",
     "domain:ozonusercontent.com",
+    "domain:cdn-ozon.ru",
     "domain:ozone.ru",
     "domain:wildberries.ru",
     "domain:wb.ru",
+    "domain:wbstatic.ru",
     "domain:wbbasket.ru",
     "domain:wbstatic.net",
+    "domain:wildberries.by",
+    "domain:wildberries.kz",
+    "domain:wildberries.am",
+    "domain:wildberries.uz",
+    "domain:wildberries.tj",
+    "domain:wildberries.kg",
+    "domain:wildberries.az",
+    "domain:wildberries.ge",
+    "domain:wildberries.com",
     "domain:lamoda.ru",
     "domain:megamarket.ru",
     "domain:sbermegamarket.ru",
+    "domain:yandex.market",
+    "domain:market.yandex.ru",
+    "domain:beru.ru",
+    "domain:goods.ru",
+    "domain:kazanexpress.ru",
+    "domain:magnitmarket.ru",
+    "domain:kuper.ru",
     "domain:samokat.ru",
     "domain:delivery-club.ru",
+    "domain:lavka.yandex.ru",
+    "domain:eda.yandex.ru",
+    "domain:sbermarket.ru",
+    "domain:vprok.ru",
+    "domain:utkonos.ru",
+    "domain:auchan.ru",
+    "domain:lenta.com",
+    "domain:lenta.ru",
+    "domain:metro-cc.ru",
+    "domain:okeydostavka.ru",
+    "domain:perekrestok.ru",
+    "domain:pyaterochka.ru",
+    "domain:magnit.ru",
+    "domain:dixy.ru",
+    "domain:dns-shop.ru",
+    "domain:mvideo.ru",
+    "domain:eldorado.ru",
+    "domain:citilink.ru",
+    "domain:holodilnik.ru",
+    "domain:technopark.ru",
+    "domain:restore.ru",
+    "domain:re-store.ru",
+    "domain:goldapple.ru",
+    "domain:letu.ru",
+    "domain:rivegauche.ru",
+    "domain:detmir.ru",
+    "domain:sportmaster.ru",
+    "domain:apteka.ru",
+    "domain:eapteka.ru",
+    "domain:uteka.ru",
+    "domain:asna.ru",
     "domain:2gis.ru",
     "domain:2gis.com",
     "domain:doublegis.com",
@@ -635,6 +690,7 @@ def load_config() -> Config:
         payment_banks=_get(raw, "PAYMENT_BANKS", "Сбер / Т-Банк"),
         public_base_url=_get(raw, "PUBLIC_BASE_URL", default_public_base_url).rstrip("/"),
         web_port=int(_get(raw, "PORT", "0") or "0"),
+        admin_web_token=_get(raw, "ADMIN_WEB_TOKEN"),
         reserve_vpn_host=_get(raw, "RESERVE_VPN_HOST"),
     )
 
@@ -1463,8 +1519,94 @@ class TelegramBot:
         except Exception:
             logging.warning("Could not answer callback query", exc_info=True)
 
+def admin_row_to_json(row: dict[str, Any], last_seen: dict[str, str] | None = None) -> dict[str, Any]:
+    last_seen = last_seen or {}
+    emails = request_device_emails(row)
+    latest_seen = max((last_seen.get(email, "") for email in emails), default="")
+    devices = request_devices(row)
+    return {
+        "id": int(row.get("id") or 0),
+        "status": request_status_ru(row.get("status")),
+        "raw_status": str(row.get("status") or ""),
+        "chat_id": int(row.get("chat_id") or 0),
+        "username": format_username(str(row.get("username") or "")),
+        "full_name": str(row.get("full_name") or "-"),
+        "profile_type": str(row.get("profile_type") or "default"),
+        "profile_label": profile_label(str(row.get("profile_type") or "default")),
+        "subscription": subscription_display(row),
+        "plan_id": str(row.get("plan_id") or "1"),
+        "plan": plan_label(row.get("plan_id")),
+        "devices_count": len(devices),
+        "devices_limit": request_device_limit(row),
+        "is_free": bool(row.get("is_free")),
+        "last_seen": format_age(latest_seen),
+        "client_email": str(row.get("client_email") or ""),
+        "uuid": str(row.get("uuid") or ""),
+        "pending_plan": plan_label(row.get("pending_plan_id")) if row.get("pending_plan_id") else "",
+        "devices": [
+            {
+                "id": int(device.get("device_id") or 1),
+                "name": device_label(device),
+                "email": str(device.get("client_email") or ""),
+                "uuid": str(device.get("uuid") or ""),
+                "profile_label": profile_label(str(device.get("profile_type") or row.get("profile_type") or "default")),
+                "last_seen": format_age(last_seen.get(str(device.get("client_email") or ""), "")),
+            }
+            for device in devices
+        ],
+    }
 
-def start_routing_web_server(config: Config) -> None:
+
+def admin_public_config() -> dict[str, Any]:
+    return {
+        "plans": [{"id": plan_id, "label": plan_label(plan_id)} for plan_id in sorted(SUBSCRIPTION_PLANS, key=int)],
+        "profiles": [{"id": key, "label": value["button"]} for key, value in OPERATOR_PROFILES.items()],
+    }
+
+
+def build_admin_html() -> str:
+    public_config = json.dumps(admin_public_config(), ensure_ascii=False)
+    return f"""<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VPN Admin</title>
+<style>
+:root{{--bg:#07110f;--card:rgba(255,255,255,.82);--ink:#10201d;--muted:#63736e;--brand:#143c31;--blue:#246bfe;--red:#dc3f3f;--amber:#d99221}}
+*{{box-sizing:border-box}}body{{margin:0;min-height:100vh;color:var(--ink);font-family:Trebuchet MS,Segoe UI,sans-serif;background:radial-gradient(circle at 10% 12%,rgba(60,210,135,.3),transparent 32rem),radial-gradient(circle at 90% 0,rgba(246,186,92,.25),transparent 28rem),linear-gradient(135deg,#07110f,#10231f 62%,#1c160d)}}
+.wrap{{max-width:1420px;margin:0 auto;padding:26px}}.hero{{display:flex;justify-content:space-between;gap:18px;align-items:center;color:#fff;padding:26px;border-radius:30px;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.16);box-shadow:0 24px 80px rgba(0,0,0,.28);backdrop-filter:blur(18px)}}
+h1{{margin:0;font-size:clamp(34px,5vw,62px);letter-spacing:-2px}}.hero p{{color:rgba(255,255,255,.76)}}.pill{{padding:12px 16px;border-radius:999px;background:rgba(255,255,255,.14);color:#eaf7ef;white-space:nowrap}}
+.grid{{display:grid;grid-template-columns:300px 1fr;gap:18px;margin-top:18px}}.panel{{border-radius:28px;background:rgba(240,236,218,.94);border:1px solid rgba(255,255,255,.55);box-shadow:0 18px 60px rgba(0,0,0,.18)}}.side{{padding:16px;align-self:start;position:sticky;top:16px}}.main{{padding:18px}}
+button,select,input{{font:inherit}}button,.btn{{border:0;border-radius:17px;padding:12px 14px;cursor:pointer;background:rgba(255,255,255,.68);color:var(--ink)}}button:hover{{filter:brightness(1.04);transform:translateY(-1px)}}.tab{{width:100%;margin-bottom:9px;text-align:left}}.tab.on,.primary{{background:var(--brand);color:#fff}}.blue{{background:var(--blue);color:#fff}}.red{{background:var(--red);color:#fff}}.amber{{background:var(--amber);color:#fff}}
+.summary{{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-top:14px}}.metric{{padding:13px;border-radius:17px;background:rgba(255,255,255,.62)}}.metric b{{display:block;font-size:25px}}.toolbar{{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px}}.search{{flex:1;min-width:220px;border:1px solid rgba(16,32,29,.14);border-radius:17px;padding:12px;background:rgba(255,255,255,.72)}}
+.cards{{display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:14px}}.card,.box{{padding:16px;border-radius:22px;background:var(--card);border:1px solid rgba(16,32,29,.12)}}.card h3{{margin:0 0 8px;font-size:22px}}.meta{{color:var(--muted);line-height:1.55}}.badges{{display:flex;flex-wrap:wrap;gap:7px;margin:12px 0}}.badge{{padding:7px 10px;border-radius:999px;background:rgba(20,60,49,.1);font-size:13px}}.free{{background:rgba(22,163,107,.18)}}.warn{{background:rgba(217,146,33,.2)}}.actions{{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-top:12px}}.detail{{display:grid;grid-template-columns:1.1fr .9fr;gap:14px}}.device{{padding:11px;border-radius:15px;background:rgba(20,60,49,.08);word-break:break-word;margin-bottom:8px}}.login{{min-height:100vh;display:grid;place-items:center;padding:24px}}.login-card{{max-width:460px;width:100%;padding:28px;border-radius:30px;color:#fff;background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.18);backdrop-filter:blur(18px)}}.login-card input{{width:100%;margin:16px 0;border:0;border-radius:18px;padding:15px}}.hide{{display:none!important}}.toast{{position:fixed;right:18px;bottom:18px;padding:14px 16px;border-radius:16px;background:#143c31;color:#fff;box-shadow:0 18px 50px rgba(0,0,0,.22)}}pre{{white-space:pre-wrap;word-break:break-word}}@media(max-width:920px){{.grid,.detail{{grid-template-columns:1fr}}.hero{{display:block}}.side{{position:static}}.actions{{grid-template-columns:1fr}}}}
+</style></head>
+<body>
+<div id="login" class="login"><div class="login-card"><h1>VPN Admin</h1><p>Введи токен из Railway переменной <b>ADMIN_WEB_TOKEN</b>.</p><input id="tokenInput" type="password" placeholder="Админ-токен"><button class="primary" onclick="saveToken()">Открыть</button></div></div>
+<main id="app" class="wrap hide"><section class="hero"><div><h1>Панель VPN</h1><p>Клиенты, тарифы, устройства, продления, доступ и сервер в одном месте.</p></div><div id="serverPill" class="pill">Сервер: проверяем...</div></section><section class="grid"><aside class="panel side"><button class="tab on" data-kind="paid" onclick="setKind('paid')">Платные клиенты</button><button class="tab" data-kind="free" onclick="setKind('free')">Бесплатные клиенты</button><button class="tab" data-kind="pending" onclick="setKind('pending')">Заявки</button><button class="tab" data-kind="all" onclick="setKind('all')">Все профили</button><button class="tab" onclick="loadServer(true)">Ресурсы сервера</button><div id="summary" class="summary"></div></aside><section class="panel main"><div class="toolbar"><input id="search" class="search" placeholder="Поиск: username, имя, chat id..." oninput="renderCards()"><button class="primary" onclick="loadClients()">Обновить</button></div><div id="view"></div></section></section></main><div id="toast" class="toast hide"></div>
+<script>
+const APP_CONFIG={public_config};let token=localStorage.getItem('vpnAdminToken')||new URLSearchParams(location.search).get('token')||'';let kind='paid';let clients=[];let selected=null;
+function saveToken(){{token=document.getElementById('tokenInput').value.trim();localStorage.setItem('vpnAdminToken',token);boot()}}
+function toast(t){{let n=document.getElementById('toast');n.textContent=t;n.classList.remove('hide');setTimeout(()=>n.classList.add('hide'),2800)}}
+async function api(path,opt={{}}){{let h=Object.assign({{'X-Admin-Token':token}},opt.headers||{{}});if(opt.body&&typeof opt.body!=='string'){{h['Content-Type']='application/json';opt.body=JSON.stringify(opt.body)}}let r=await fetch(path,Object.assign(opt,{{headers:h}}));let d=await r.json();if(r.status===401||r.status===403){{localStorage.removeItem('vpnAdminToken');document.getElementById('app').classList.add('hide');document.getElementById('login').classList.remove('hide')}}if(!r.ok||d.ok===false)throw new Error(d.error||'Ошибка');return d}}
+function boot(){{if(!token)return;document.getElementById('login').classList.add('hide');document.getElementById('app').classList.remove('hide');loadSummary();loadClients();loadServer(false)}}
+async function loadSummary(){{try{{let d=await api('/admin/api/summary'),s=d.summary;document.getElementById('summary').innerHTML=`<div class="metric"><b>${{s.paid}}</b>платных</div><div class="metric"><b>${{s.free}}</b>бесплатных</div><div class="metric"><b>${{s.pending}}</b>заявок</div><div class="metric"><b>${{s.devices}}</b>устройств</div>`}}catch(e){{toast(e.message)}}}}
+function setKind(k){{kind=k;selected=null;document.querySelectorAll('.tab[data-kind]').forEach(x=>x.classList.toggle('on',x.dataset.kind===kind));loadClients()}}
+async function loadClients(){{try{{let d=await api('/admin/api/clients?kind='+encodeURIComponent(kind));clients=d.clients;renderCards();loadSummary()}}catch(e){{toast(e.message)}}}}
+function ok(row){{let q=document.getElementById('search').value.trim().toLowerCase();return !q||[row.id,row.chat_id,row.username,row.full_name,row.profile_label,row.plan].join(' ').toLowerCase().includes(q)}}
+function renderCards(){{if(selected)return renderDetail(selected);let rows=clients.filter(ok),title={{paid:'Платные клиенты',free:'Бесплатные клиенты',pending:'Заявки',all:'Все профили'}}[kind]||'Клиенты';document.getElementById('view').innerHTML=`<h2>${{title}} · ${{rows.length}}</h2><div class="cards">${{rows.map(card).join('')||'<div class="box">Пока пусто.</div>'}}</div>`}}
+function card(r){{let p=r.raw_status==='pending';return `<article class="card"><h3>#${{r.id}} · ${{r.username}}</h3><div class="meta">${{r.full_name}}<br>Chat ID: ${{r.chat_id}}<br>Активность: ${{r.last_seen}}</div><div class="badges"><span class="badge">${{r.status}}</span><span class="badge ${{r.is_free?'free':''}}">${{r.is_free?'бесплатный':r.plan}}</span><span class="badge">${{r.devices_count}}/${{r.devices_limit}} устр.</span><span class="badge">${{r.profile_label}}</span>${{r.pending_plan?`<span class="badge warn">смена: ${{r.pending_plan}}</span>`:''}}</div><div class="actions"><button class="primary" onclick="openClient(${{r.id}})">Открыть</button>${{p?`<button class="blue" onclick="action('approve',${{r.id}})">Одобрить</button><button class="red" onclick="action('reject',${{r.id}})">Отклонить</button>`:`<button onclick="quickStats(${{r.id}})">Статистика</button>`}}</div></article>`}}
+async function openClient(id){{try{{let d=await api('/admin/api/client?id='+id);selected=d.client;renderDetail(selected)}}catch(e){{toast(e.message)}}}}
+function renderDetail(r){{let plans=APP_CONFIG.plans.map(p=>`<option value="${{p.id}}" ${{p.id===r.plan_id?'selected':''}}>${{p.label}}</option>`).join(''),profiles=APP_CONFIG.profiles.map(p=>`<option value="${{p.id}}" ${{p.id===r.profile_type?'selected':''}}>${{p.label}}</option>`).join('');document.getElementById('view').innerHTML=`<button onclick="selected=null;renderCards()">← Назад</button><div class="detail" style="margin-top:14px"><section class="box"><h2>Клиент #${{r.id}} · ${{r.username}}</h2><p class="meta">${{r.full_name}}<br>Chat ID: ${{r.chat_id}}<br>Статус: ${{r.status}}<br>Подписка: ${{r.subscription}}<br>Тариф: ${{r.plan}}<br>Оператор: ${{r.profile_label}}<br>Активность: ${{r.last_seen}}</p><h3>Устройства</h3>${{r.devices.map(d=>`<div class="device"><b>${{d.name}}</b><br>${{d.profile_label}}<br>Email: ${{d.email}}<br>Активность: ${{d.last_seen}}</div>`).join('')||'Нет устройств'}}</section><section class="box"><h3>Действия</h3><div class="actions"><button onclick="action('extend',${{r.id}},{{days:7}})">+7 дней</button><button onclick="action('extend',${{r.id}},{{days:30}})">+30 дней</button><button onclick="action('extend',${{r.id}},{{days:90}})">+90 дней</button><button class="red" onclick="confirmAction('disable',${{r.id}},'Отключить все ссылки клиента?')">Отключить</button></div><div class="box" style="margin-top:12px"><label>Тариф</label><select id="planSelect">${{plans}}</select><button class="primary" style="margin-top:8px;width:100%" onclick="action('set_plan',${{r.id}},{{plan_id:document.getElementById('planSelect').value}})">Сменить тариф</button></div><div class="box" style="margin-top:12px"><label>Оператор / перевыпуск основной ссылки</label><select id="profileSelect">${{profiles}}</select><button class="amber" style="margin-top:8px;width:100%" onclick="confirmAction('reissue',${{r.id}},'Перевыпустить основную ссылку?',{{profile_type:document.getElementById('profileSelect').value}})">Перевыпустить</button></div><div class="actions"><button class="blue" onclick="action('set_free',${{r.id}},{{is_free:${{r.is_free?'false':'true'}}}})">${{r.is_free?'Убрать бесплатный':'Сделать бесплатным'}}</button><button onclick="quickStats(${{r.id}})">Статистика</button><button onclick="action('approve_plan',${{r.id}})">Одобрить смену тарифа</button><button onclick="action('reject_plan',${{r.id}})">Отклонить смену тарифа</button></div><pre id="statsBox"></pre></section></div>`}}
+function confirmAction(n,id,t,e={{}}){{if(confirm(t))action(n,id,e)}}async function action(n,id,e={{}}){{try{{let d=await api('/admin/api/action',{{method:'POST',body:Object.assign({{action:n,id}},e)}});toast(d.message||'Готово');selected=null;await loadClients()}}catch(x){{toast(x.message)}}}}
+async function quickStats(id){{try{{let d=await api('/admin/api/client_stats?id='+id);if(selected)document.getElementById('statsBox').textContent=d.text;else alert(d.text)}}catch(e){{toast(e.message)}}}}
+async function loadServer(show){{try{{let d=await api('/admin/api/server');document.getElementById('serverPill').textContent=`Xray: ${{d.status.xray||'-'}} · CPU ${{d.status.cpu||'-'}}% · RAM ${{d.status.memory||'-'}}`;if(show){{selected=null;document.getElementById('view').innerHTML=`<h2>Ресурсы сервера</h2><div class="box"><pre>${{d.text}}</pre></div>`}}}}catch(e){{toast(e.message)}}}}
+boot();
+</script></body></html>"""
+
+
+def start_routing_web_server(config: Config, store: Store | None = None, manager: Any = None, bot: TelegramBot | None = None) -> None:
     if config.web_port <= 0:
         return
 
@@ -1476,6 +1618,9 @@ def start_routing_web_server(config: Config) -> None:
             payload = body.encode("utf-8")
             self._send_bytes(status, payload, content_type)
 
+        def _send_json(self, status: int, data: dict[str, Any]) -> None:
+            self._send_text(status, json.dumps(data, ensure_ascii=False), "application/json; charset=utf-8")
+
         def _send_bytes(self, status: int, payload: bytes, content_type: str) -> None:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
@@ -1484,10 +1629,42 @@ def start_routing_web_server(config: Config) -> None:
             self.end_headers()
             self.wfile.write(payload)
 
+        def _admin_token(self) -> str:
+            header = self.headers.get("X-Admin-Token", "")
+            if header:
+                return header.strip()
+            query = parse_qs(urlparse(self.path).query)
+            return str((query.get("token") or [""])[0]).strip()
+
+        def _require_admin(self) -> bool:
+            if not config.admin_web_token:
+                self._send_json(403, {"ok": False, "error": "ADMIN_WEB_TOKEN не настроен в Railway."})
+                return False
+            if not compare_digest(self._admin_token(), config.admin_web_token):
+                self._send_json(401, {"ok": False, "error": "Неверный админ-токен."})
+                return False
+            if not store or not manager:
+                self._send_json(503, {"ok": False, "error": "Админка ещё запускается."})
+                return False
+            return True
+
+        def _read_json(self) -> dict[str, Any]:
+            length = int(self.headers.get("Content-Length") or "0")
+            if length <= 0:
+                return {}
+            return json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+
         def do_GET(self) -> None:
-            path = self.path.split("?", 1)[0]
+            parsed = urlparse(self.path)
+            path = parsed.path
             if path in {"/", "/healthz"}:
                 self._send_text(200, "ok\n")
+                return
+            if path == "/admin":
+                self._send_text(200, build_admin_html(), "text/html; charset=utf-8")
+                return
+            if path.startswith("/admin/api/"):
+                self._handle_admin_get(path, parse_qs(parsed.query))
                 return
             if path == "/happ-routing-qr.png":
                 try:
@@ -1517,10 +1694,208 @@ def start_routing_web_server(config: Config) -> None:
             )
             self._send_text(200, body, "text/html; charset=utf-8")
 
-    server = HTTPServer(("0.0.0.0", config.web_port), RoutingHandler)
+        def do_POST(self) -> None:
+            parsed = urlparse(self.path)
+            if parsed.path.startswith("/admin/api/"):
+                self._handle_admin_post(parsed.path)
+                return
+            self._send_json(404, {"ok": False, "error": "Не найдено."})
+
+        def _rows_with_activity(self, rows: list[dict[str, Any]]) -> dict[str, str]:
+            emails = [email for row in rows for email in request_device_emails(row)]
+            try:
+                return manager.get_last_seen_by_email(emails) if emails else {}
+            except Exception:
+                logging.exception("Admin web: could not load activity")
+                return {}
+
+        def _handle_admin_get(self, path: str, query: dict[str, list[str]]) -> None:
+            if not self._require_admin():
+                return
+            assert store is not None
+            try:
+                if path == "/admin/api/summary":
+                    approved = store.list_approved_requests()
+                    paid = store.list_paid_requests()
+                    free = store.list_free_requests()
+                    pending = [row for row in store.export_data().get("requests", []) if row.get("status") == "pending"]
+                    self._send_json(200, {"ok": True, "summary": {
+                        "paid": len(paid),
+                        "free": len(free),
+                        "pending": len(pending),
+                        "all": len(approved),
+                        "devices": sum(len(request_devices(row)) for row in approved),
+                    }})
+                    return
+                if path == "/admin/api/clients":
+                    kind = str((query.get("kind") or ["paid"])[0])
+                    if kind == "free":
+                        rows = store.list_free_requests()
+                    elif kind == "pending":
+                        rows = [row for row in store.export_data().get("requests", []) if row.get("status") == "pending"]
+                    elif kind == "all":
+                        rows = store.export_data().get("requests", [])
+                    else:
+                        rows = store.list_paid_requests()
+                    rows = sorted(rows, key=lambda item: int(item.get("id") or 0), reverse=True)
+                    last_seen = self._rows_with_activity(rows)
+                    self._send_json(200, {"ok": True, "clients": [admin_row_to_json(row, last_seen) for row in rows]})
+                    return
+                if path == "/admin/api/client":
+                    request_id = int((query.get("id") or ["0"])[0])
+                    row = store.get_request(request_id)
+                    if not row:
+                        self._send_json(404, {"ok": False, "error": "Клиент не найден."})
+                        return
+                    last_seen = self._rows_with_activity([row])
+                    self._send_json(200, {"ok": True, "client": admin_row_to_json(row, last_seen)})
+                    return
+                if path == "/admin/api/server":
+                    status = manager.check_server_status()
+                    self._send_json(200, {"ok": True, "status": status, "text": format_vpn_status(status, config)})
+                    return
+                if path == "/admin/api/client_stats":
+                    request_id = int((query.get("id") or ["0"])[0])
+                    row = store.get_request(request_id)
+                    if not row or not row.get("client_email"):
+                        self._send_json(404, {"ok": False, "error": "Клиент не найден."})
+                        return
+                    all_emails = [email for item in store.list_approved_requests() for email in request_device_emails(item)]
+                    stats = manager.get_usage_stats(str(row["client_email"]), all_emails)
+                    self._send_json(200, {"ok": True, "stats": stats, "text": format_usage_stats(row, stats)})
+                    return
+                self._send_json(404, {"ok": False, "error": "Не найдено."})
+            except Exception as exc:
+                logging.exception("Admin web GET failed")
+                self._send_json(500, {"ok": False, "error": str(exc)})
+
+        def _handle_admin_post(self, path: str) -> None:
+            if not self._require_admin():
+                return
+            assert store is not None
+            if path != "/admin/api/action":
+                self._send_json(404, {"ok": False, "error": "Не найдено."})
+                return
+            try:
+                payload = self._read_json()
+                action = str(payload.get("action") or "")
+                request_id = int(payload.get("id") or 0)
+                row = store.get_request(request_id)
+                if not row:
+                    self._send_json(404, {"ok": False, "error": "Профиль не найден."})
+                    return
+                if action == "approve":
+                    if row.get("status") != "pending":
+                        self._send_json(400, {"ok": False, "error": "Заявка уже обработана."})
+                        return
+                    profile_type = str(row.get("profile_type") or "default")
+                    if not is_profile_type(profile_type):
+                        profile_type = "default"
+                    client_uuid = str(uuid.uuid4())
+                    client_email = f"tg-{row['chat_id']}-{request_id}"
+                    manager.save_client(client_email, client_uuid)
+                    store.finish_request(request_id, "approved", profile_type, client_email, client_uuid, config.default_subscription_days)
+                    link = build_vless_link(config, client_uuid, profile_type, f"VPN {request_id} {profile_short(profile_type)}")
+                    if bot:
+                        bot.send_message(int(row["chat_id"]), f"Заявка одобрена.\n\nТвоя VPN-ссылка:\n\n{link}")
+                    self._send_json(200, {"ok": True, "message": f"Заявка #{request_id} одобрена."})
+                    return
+                if action == "reject":
+                    if row.get("status") != "pending":
+                        self._send_json(400, {"ok": False, "error": "Заявка уже обработана."})
+                        return
+                    store.finish_request(request_id, "rejected", "", "", "")
+                    if bot:
+                        bot.send_message(int(row["chat_id"]), f"Заявка #{request_id} отклонена.")
+                    self._send_json(200, {"ok": True, "message": f"Заявка #{request_id} отклонена."})
+                    return
+                if action == "extend":
+                    days = int(payload.get("days") or 0)
+                    if days not in {7, 30, 90}:
+                        self._send_json(400, {"ok": False, "error": "Неверный срок продления."})
+                        return
+                    if row.get("status") == "expired":
+                        for device in request_devices(row):
+                            manager.save_client(str(device["client_email"]), str(device["uuid"]))
+                    updated = store.extend_subscription(request_id, days)
+                    text = f"Подписка профиля #{request_id} продлена на {days} дней: {format_subscription(str(updated.get('subscription_until') if updated else ''))}."
+                    if updated and bot:
+                        bot.send_message(int(updated["chat_id"]), text)
+                    self._send_json(200, {"ok": True, "message": text})
+                    return
+                if action == "set_plan":
+                    plan_id = str(payload.get("plan_id") or "")
+                    updated = store.set_plan(request_id, plan_id)
+                    if not updated:
+                        self._send_json(400, {"ok": False, "error": "Не смог сменить тариф."})
+                        return
+                    removed = enforce_device_limit(manager, store, updated)
+                    text = f"Тариф профиля #{request_id} изменён на {plan_label(plan_id)}."
+                    if removed:
+                        text += f" Отключено лишних устройств: {len(removed)}."
+                    self._send_json(200, {"ok": True, "message": text})
+                    return
+                if action == "approve_plan":
+                    updated = store.approve_plan_change(request_id)
+                    if not updated:
+                        self._send_json(400, {"ok": False, "error": "Нет заявки на смену тарифа."})
+                        return
+                    removed = enforce_device_limit(manager, store, updated)
+                    text = f"Смена тарифа профиля #{request_id} одобрена."
+                    if removed:
+                        text += f" Отключено лишних устройств: {len(removed)}."
+                    self._send_json(200, {"ok": True, "message": text})
+                    return
+                if action == "reject_plan":
+                    if not store.reject_plan_change(request_id):
+                        self._send_json(400, {"ok": False, "error": "Профиль не найден."})
+                        return
+                    self._send_json(200, {"ok": True, "message": f"Смена тарифа профиля #{request_id} отклонена."})
+                    return
+                if action == "set_free":
+                    updated = store.set_free_access(request_id, bool(payload.get("is_free")))
+                    if not updated:
+                        self._send_json(404, {"ok": False, "error": "Профиль не найден."})
+                        return
+                    self._send_json(200, {"ok": True, "message": f"Бесплатный доступ профиля #{request_id}: {'включён' if updated.get('is_free') else 'выключен'}."})
+                    return
+                if action == "disable":
+                    if row.get("status") != "approved":
+                        self._send_json(400, {"ok": False, "error": "Отключать можно только активный профиль."})
+                        return
+                    for client_email in request_device_emails(row):
+                        manager.remove_client(client_email)
+                    store.disable_request(request_id)
+                    if bot:
+                        bot.send_message(int(row["chat_id"]), "Твой VPN-профиль отключён админом. Старые ссылки больше не работают.")
+                    self._send_json(200, {"ok": True, "message": f"Профиль #{request_id} отключён."})
+                    return
+                if action == "reissue":
+                    if row.get("status") != "approved":
+                        self._send_json(400, {"ok": False, "error": "Перевыпуск доступен только активному профилю."})
+                        return
+                    profile_type = str(payload.get("profile_type") or row.get("profile_type") or "default")
+                    if not is_profile_type(profile_type):
+                        profile_type = "default"
+                    client_email = str(row.get("client_email") or f"tg-{row['chat_id']}-{request_id}")
+                    client_uuid = str(uuid.uuid4())
+                    link = build_vless_link(config, client_uuid, profile_type, f"VPN {request_id} {profile_short(profile_type)}")
+                    manager.save_client(client_email, client_uuid)
+                    manager.reset_profile_guard_binding(client_email)
+                    store.update_profile(request_id, profile_type, client_email, client_uuid)
+                    if bot:
+                        bot.send_message(int(row["chat_id"]), f"Новая VPN-ссылка создана. Старая больше не работает.\n\n{link}")
+                    self._send_json(200, {"ok": True, "message": f"Профиль #{request_id} перевыпущен как {profile_label(profile_type)}."})
+                    return
+                self._send_json(400, {"ok": False, "error": "Неизвестное действие."})
+            except Exception as exc:
+                logging.exception("Admin web action failed")
+                self._send_json(500, {"ok": False, "error": str(exc)})
+
+    server = ThreadingHTTPServer(("0.0.0.0", config.web_port), RoutingHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    logging.info("Routing web server started on port %s", config.web_port)
+    logging.info("Routing/admin web server started on port %s", config.web_port)
 
 
 class XrayManager:
@@ -1891,37 +2266,6 @@ fi
         finally:
             client.close()
 
-    def ensure_profile_guard_enabled(self) -> dict[str, str]:
-        client = self._connect()
-        try:
-            command = r"""
-systemctl unmask xray-profile-guard >/dev/null 2>&1 || true
-cat >/etc/systemd/system/xray-profile-guard.service <<'EOF'
-[Unit]
-Description=Xray profile one-device guard
-After=xray.service
-Requires=xray.service
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/python3 /usr/local/bin/xray-profile-guard.py
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-EOF
-systemctl daemon-reload
-systemctl enable --now xray-profile-guard
-systemctl is-active xray-profile-guard
-"""
-            rc, out, err = self._run(client, command)
-            if rc != 0:
-                raise RuntimeError(f"Profile guard enable failed: {out}{err}")
-            return {"guard": out.strip() or "unknown"}
-        finally:
-            client.close()
-
         tracked_emails = set(all_client_emails or [])
         hits = 0
         total_tracked_hits = 0
@@ -1959,6 +2303,37 @@ systemctl is-active xray-profile-guard
             "first_seen": first_seen,
             "last_seen": last_seen,
         }
+
+    def ensure_profile_guard_enabled(self) -> dict[str, str]:
+        client = self._connect()
+        try:
+            command = r"""
+systemctl unmask xray-profile-guard >/dev/null 2>&1 || true
+cat >/etc/systemd/system/xray-profile-guard.service <<'EOF'
+[Unit]
+Description=Xray profile one-device guard
+After=xray.service
+Requires=xray.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/xray-profile-guard.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable --now xray-profile-guard
+systemctl is-active xray-profile-guard
+"""
+            rc, out, err = self._run(client, command)
+            if rc != 0:
+                raise RuntimeError(f"Profile guard enable failed: {out}{err}")
+            return {"guard": out.strip() or "unknown"}
+        finally:
+            client.close()
 
     def check_server_status(self) -> dict[str, Any]:
         client = self._connect()
@@ -3829,10 +4204,10 @@ def check_inactive_clients(bot: TelegramBot, store: Store, config: Config, manag
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     config = load_config()
-    start_routing_web_server(config)
     store = Store(config.db_path)
     bot = TelegramBot(config.telegram_token)
     manager = XrayManager(config)
+    start_routing_web_server(config, store, manager, bot)
     remote_state_checked = False
     try:
         remote_state = manager.load_state_backup()
