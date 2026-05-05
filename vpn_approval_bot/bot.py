@@ -8,7 +8,7 @@ import shlex
 import threading
 import time
 import uuid
-from base64 import b64encode
+from base64 import b64encode, urlsafe_b64decode, urlsafe_b64encode
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from hmac import compare_digest
@@ -321,15 +321,31 @@ HAPP_ROUTING_PROXY_SITES = [
     "geosite:tiktok",
     "domain:tiktok.com",
     "domain:tiktokcdn.com",
+    "domain:tiktokcdn-eu.com",
     "domain:tiktokv.com",
     "domain:tiktokcdn-us.com",
+    "domain:tiktokrow-cdn.com",
+    "domain:tiktokrow.com",
+    "domain:tiktokmusic.app",
+    "domain:tiktokshop.com",
+    "domain:ttlivecdn.com",
+    "domain:ttwstatic.com",
+    "domain:ttwebview.com",
     "domain:musical.ly",
+    "domain:muscdn.com",
+    "domain:bytedance.com",
     "domain:byteoversea.com",
     "domain:byteoversea.net",
+    "domain:bytegecko-i18n.com",
     "domain:ibytedtos.com",
     "domain:ibyteimg.com",
     "domain:byteimg.com",
     "domain:bytecdn.cn",
+    "domain:snssdk.com",
+    "domain:isnssdk.com",
+    "domain:pstatp.com",
+    "domain:capcut.com",
+    "domain:capcutapi.com",
 ]
 
 HAPP_ROUTING_DIRECT_IPS = [
@@ -534,6 +550,21 @@ def happ_routing_qr_url(config: Config) -> str:
     if not config.public_base_url:
         return ""
     return f"{config.public_base_url}/happ-routing-qr.png"
+
+
+def encode_happ_setup_link(vpn_link: str) -> str:
+    return urlsafe_b64encode(vpn_link.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def decode_happ_setup_link(value: str) -> str:
+    padding = "=" * (-len(value) % 4)
+    return urlsafe_b64decode((value + padding).encode("ascii")).decode("utf-8")
+
+
+def happ_setup_url(config: Config, vpn_link: str) -> str:
+    if not config.public_base_url:
+        return ""
+    return f"{config.public_base_url}/happ-setup?link={encode_happ_setup_link(vpn_link)}"
 
 
 def build_qr_png(data: str) -> bytes:
@@ -1606,6 +1637,40 @@ boot();
 </script></body></html>"""
 
 
+def build_happ_setup_html(vpn_link: str) -> str:
+    routing_link = build_happ_routing_link()
+    safe_vpn = escape(vpn_link, quote=True)
+    safe_routing = escape(routing_link, quote=True)
+    return (
+        "<!doctype html><html lang=\"ru\"><head>"
+        "<meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+        "<title>Настройка Happ</title>"
+        "<style>"
+        "body{margin:0;min-height:100vh;display:grid;place-items:center;background:linear-gradient(135deg,#111827,#17352d);font-family:Trebuchet MS,Segoe UI,sans-serif;color:#fff}"
+        ".card{width:min(560px,92vw);padding:28px;border-radius:28px;background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.18);box-shadow:0 24px 80px rgba(0,0,0,.3);backdrop-filter:blur(18px)}"
+        "h1{margin:0 0 12px;font-size:34px;line-height:1.05}.muted{color:rgba(255,255,255,.72);line-height:1.5}.steps{display:grid;gap:12px;margin-top:20px}"
+        "a,button{display:block;text-align:center;text-decoration:none;border:0;border-radius:18px;padding:15px 16px;font:inherit;font-weight:700;color:#10201d;background:#f5f0d8;cursor:pointer}"
+        ".primary{background:#54d18c;color:#062018}.secondary{background:#d9edff}.small{font-size:13px;color:rgba(255,255,255,.62);word-break:break-word;margin-top:16px}"
+        "</style>"
+        "<script>"
+        "const vpn=" + json.dumps(vpn_link) + ";"
+        "const routing=" + json.dumps(routing_link) + ";"
+        "function openVpn(){location.href=vpn}"
+        "function openRouting(){location.href=routing}"
+        "window.addEventListener('load',()=>{setTimeout(openVpn,500);setTimeout(openRouting,2600);});"
+        "</script></head><body><main class=\"card\">"
+        "<h1>Настраиваю Happ</h1>"
+        "<p class=\"muted\">Сейчас телефон попробует открыть Happ и добавить VPN-профиль. После этого вернись на эту страницу и нажми маршрутизацию, если она не применилась автоматически.</p>"
+        "<div class=\"steps\">"
+        "<a class=\"primary\" href=\"" + safe_vpn + "\">1. Добавить VPN-профиль в Happ</a>"
+        "<a class=\"secondary\" href=\"" + safe_routing + "\">2. Применить маршрутизацию TikTok/маркетплейсы</a>"
+        "</div>"
+        "<p class=\"small\">Если iPhone/Telegram запретил автоматический переход, нажми кнопки по очереди. Копировать ссылку больше не нужно.</p>"
+        "</main></body></html>"
+    )
+
+
 def start_routing_web_server(config: Config, store: Store | None = None, manager: Any = None, bot: TelegramBot | None = None) -> None:
     if config.web_port <= 0:
         return
@@ -1665,6 +1730,19 @@ def start_routing_web_server(config: Config, store: Store | None = None, manager
                 return
             if path.startswith("/admin/api/"):
                 self._handle_admin_get(path, parse_qs(parsed.query))
+                return
+            if path == "/happ-setup":
+                query = parse_qs(parsed.query)
+                encoded_link = str((query.get("link") or [""])[0])
+                try:
+                    vpn_link = decode_happ_setup_link(encoded_link)
+                except Exception:
+                    self._send_text(400, "bad vpn link\n")
+                    return
+                if not vpn_link.startswith("vless://"):
+                    self._send_text(400, "bad vpn link\n")
+                    return
+                self._send_text(200, build_happ_setup_html(vpn_link), "text/html; charset=utf-8")
                 return
             if path == "/happ-routing-qr.png":
                 try:
@@ -1797,7 +1875,11 @@ def start_routing_web_server(config: Config, store: Store | None = None, manager
                     store.finish_request(request_id, "approved", profile_type, client_email, client_uuid, config.default_subscription_days)
                     link = build_vless_link(config, client_uuid, profile_type, f"VPN {request_id} {profile_short(profile_type)}")
                     if bot:
-                        bot.send_message(int(row["chat_id"]), f"Заявка одобрена.\n\nТвоя VPN-ссылка:\n\n{link}")
+                        bot.send_message(
+                            int(row["chat_id"]),
+                            f"Заявка одобрена.\n\nТвоя VPN-ссылка:\n\n{link}",
+                            happ_setup_markup(config, link),
+                        )
                     self._send_json(200, {"ok": True, "message": f"Заявка #{request_id} одобрена."})
                     return
                 if action == "reject":
@@ -1884,7 +1966,11 @@ def start_routing_web_server(config: Config, store: Store | None = None, manager
                     manager.reset_profile_guard_binding(client_email)
                     store.update_profile(request_id, profile_type, client_email, client_uuid)
                     if bot:
-                        bot.send_message(int(row["chat_id"]), f"Новая VPN-ссылка создана. Старая больше не работает.\n\n{link}")
+                        bot.send_message(
+                            int(row["chat_id"]),
+                            f"Новая VPN-ссылка создана. Старая больше не работает.\n\n{link}",
+                            happ_setup_markup(config, link),
+                        )
                     self._send_json(200, {"ok": True, "message": f"Профиль #{request_id} перевыпущен как {profile_label(profile_type)}."})
                     return
                 self._send_json(400, {"ok": False, "error": "Неизвестное действие."})
@@ -2510,6 +2596,24 @@ def routing_open_markup(open_url: str) -> str:
     )
 
 
+def happ_setup_markup(config: Config, vpn_link: str, fallback_markup: str | None = None) -> str | None:
+    setup_url = happ_setup_url(config, vpn_link)
+    if not setup_url:
+        return fallback_markup
+    rows = [
+        [{"text": "Добавить в Happ и применить маршрутизацию", "url": setup_url}],
+    ]
+    routing_url = happ_routing_redirect_url(config)
+    if routing_url:
+        rows.append([{"text": "Только обновить маршрутизацию Happ", "url": routing_url}])
+    if fallback_markup:
+        try:
+            rows.extend(json.loads(fallback_markup).get("inline_keyboard") or [])
+        except Exception:
+            logging.warning("Could not merge fallback inline keyboard", exc_info=True)
+    return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
+
+
 def subscription_actions_markup(request_id: int) -> str:
     return json.dumps(
         {
@@ -2532,12 +2636,19 @@ def reissue_choice_markup(request_id: int) -> str:
     )
 
 
-def user_devices_markup(row: dict[str, Any]) -> str:
+def user_devices_markup(row: dict[str, Any], config: Config | None = None) -> str:
     request_id = int(row["id"])
-    rows = [
-        [{"text": f"Перевыпустить ссылку: {device_label(device)}", "callback_data": f"reissue_device:{request_id}:{int(device.get('device_id') or 1)}"}]
-        for device in request_devices(row)
-    ]
+    rows = []
+    for device in request_devices(row):
+        device_id = int(device.get("device_id") or 1)
+        if config and device.get("uuid"):
+            profile_type = str(device.get("profile_type") or row.get("profile_type") or "default")
+            label = f"VPN {request_id} D{device_id} {profile_short(profile_type)}"
+            link = build_vless_link(config, str(device["uuid"]), profile_type, label)
+            setup_url = happ_setup_url(config, link)
+            if setup_url:
+                rows.append([{"text": f"Открыть в Happ: {device_label(device)}", "url": setup_url}])
+        rows.append([{"text": f"Перевыпустить ссылку: {device_label(device)}", "callback_data": f"reissue_device:{request_id}:{device_id}"}])
     rows.append([{"text": "Добавить устройство", "callback_data": "add_device"}])
     rows.append([{"text": "Назад к подписке", "callback_data": "show_subscription"}])
     return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
@@ -3355,6 +3466,7 @@ def handle_message(
                     f"Устройства: {len(request_devices(existing))}/{request_device_limit(existing)}.\n"
                     "Чтобы добавить ещё устройство, открой «Моя подписка» -> «Добавить устройство».\n\n"
                     "Основная ссылка:\n\n" + link,
+                    happ_setup_markup(config, link),
                 )
                 return
         bot.send_message(
@@ -3426,7 +3538,7 @@ def handle_callback(
             bot.answer_callback_query(callback_id, "Активный профиль не найден.")
             return
         bot.answer_callback_query(callback_id, "Показываю устройства.")
-        bot.send_message(user_chat_id, format_devices_text(existing, config), user_devices_markup(existing))
+        bot.send_message(user_chat_id, format_devices_text(existing, config), user_devices_markup(existing, config))
         return
 
     if parts[0] == "show_subscription":
@@ -3485,7 +3597,7 @@ def handle_callback(
             f"Готово. Добавлено {device_name}.\n\n"
             "Эту ссылку ставь только на одно устройство:\n\n"
             + link,
-            user_devices_markup(updated),
+            happ_setup_markup(config, link, user_devices_markup(updated, config)),
         )
         return
 
@@ -3511,11 +3623,11 @@ def handle_callback(
             manager.reset_profile_guard_binding(client_email)
         except Exception as exc:
             logging.exception("Failed to reissue VPN device")
-            bot.send_message(user_chat_id, f"Не смог перевыпустить {device_label(device)}: {exc}", user_devices_markup(row))
+            bot.send_message(user_chat_id, f"Не смог перевыпустить {device_label(device)}: {exc}", user_devices_markup(row, config))
             return
         updated = store.update_device(request_id, device_id, client_uuid, profile_type)
         if not updated:
-            bot.send_message(user_chat_id, "Ссылка обновлена на сервере, но не смог сохранить её в базе. Напиши админу.", user_devices_markup(row))
+            bot.send_message(user_chat_id, "Ссылка обновлена на сервере, но не смог сохранить её в базе. Напиши админу.", user_devices_markup(row, config))
             return
         bot.send_message(
             user_chat_id,
@@ -3523,7 +3635,7 @@ def handle_callback(
             "Старая ссылка этого устройства больше не работает.\n\n"
             "Новая VPN-ссылка:\n\n"
             + link,
-            user_devices_markup(updated),
+            happ_setup_markup(config, link, user_devices_markup(updated, config)),
         )
         return
 
@@ -3579,7 +3691,11 @@ def handle_callback(
                 label = f"VPN {existing['id']} {profile_short(existing_type)}"
                 link = build_vless_link(config, str(existing["uuid"]), existing_type, label)
                 bot.answer_callback_query(callback_id, "Профиль уже есть.")
-                bot.send_message(user_chat_id, "У тебя уже есть активный VPN-профиль:\n\n" + link)
+                bot.send_message(
+                    user_chat_id,
+                    "У тебя уже есть активный VPN-профиль:\n\n" + link,
+                    happ_setup_markup(config, link),
+                )
                 return
 
         username, full_name = user_display(from_user)
@@ -4033,6 +4149,7 @@ def handle_callback(
             int(row["chat_id"]),
             "Новая VPN-ссылка уже создана. Сейчас применяю её на сервере; старая ссылка может отключиться на несколько секунд.\n\n"
             + link,
+            happ_setup_markup(config, link),
         )
         try:
             manager.save_client(client_email, client_uuid)
@@ -4098,6 +4215,13 @@ def handle_callback(
             "Твоя VPN-ссылка:\n\n" + link,
             f"Готово. Заявка #{request_id} одобрена как {profile_label(profile_type)}. Тариф: {selected_plan_label}. Подписка: {subscription_text}.",
         )
+        setup_markup = happ_setup_markup(config, link)
+        if setup_markup:
+            bot.send_message(
+                int(row["chat_id"]),
+                "Нажми кнопку ниже, чтобы добавить VPN в Happ и применить маршрутизацию TikTok/маркетплейсы без копирования ссылки.",
+                setup_markup,
+            )
         send_routing_instructions(bot, config, int(row["chat_id"]))
 
 
