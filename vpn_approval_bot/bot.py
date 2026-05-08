@@ -16,7 +16,7 @@ from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 from urllib.request import Request, urlopen
@@ -309,28 +309,47 @@ HAPP_ROUTING_DIRECT_SITES = [
     "domain:apple.com",
     "domain:icloud.com",
     "domain:cdn-apple.com",
-    "domain:google.com",
-    "domain:www.google.com",
-    "domain:gstatic.com",
-    "domain:googleusercontent.com",
     "domain:recaptcha.net",
     "domain:hcaptcha.com",
 ]
 
 HAPP_ROUTING_PROXY_SITES = [
+    "geosite:youtube",
     "geosite:tiktok",
+    "domain:youtube.com",
+    "domain:www.youtube.com",
+    "domain:m.youtube.com",
+    "domain:music.youtube.com",
+    "domain:youtube-nocookie.com",
+    "domain:youtu.be",
+    "domain:yt.be",
+    "domain:ytimg.com",
+    "domain:i.ytimg.com",
+    "domain:googlevideo.com",
+    "domain:youtubei.googleapis.com",
+    "domain:youtube.googleapis.com",
+    "domain:youtubeembeddedplayer.googleapis.com",
+    "domain:youtubekids.com",
+    "domain:ggpht.com",
+    "domain:googleapis.com",
     "domain:tiktok.com",
+    "domain:www.tiktok.com",
+    "domain:m.tiktok.com",
+    "domain:vm.tiktok.com",
+    "domain:vt.tiktok.com",
+    "domain:tiktokcdn-us.com",
     "domain:tiktokcdn.com",
     "domain:tiktokcdn-eu.com",
     "domain:tiktokv.com",
-    "domain:tiktokcdn-us.com",
     "domain:tiktokrow-cdn.com",
     "domain:tiktokrow.com",
     "domain:tiktokmusic.app",
     "domain:tiktokshop.com",
+    "domain:tiktokcdn-in.com",
     "domain:ttlivecdn.com",
     "domain:ttwstatic.com",
     "domain:ttwebview.com",
+    "domain:tiktokcdn.com.c.footprint.net",
     "domain:musical.ly",
     "domain:muscdn.com",
     "domain:bytedance.com",
@@ -352,6 +371,27 @@ HAPP_ROUTING_DIRECT_IPS = [
     "geoip:private",
     "geoip:ru",
 ]
+
+
+def unique_strings(items: Iterable[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        value = str(item).strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
+
+
+def happ_proxy_sites() -> list[str]:
+    return unique_strings(HAPP_ROUTING_PROXY_SITES)
+
+
+def happ_direct_sites() -> list[str]:
+    proxy = set(happ_proxy_sites())
+    return [site for site in unique_strings(HAPP_ROUTING_DIRECT_SITES) if site not in proxy]
 
 
 def is_profile_type(profile_type: str) -> bool:
@@ -511,7 +551,7 @@ def qr_url_for_link(link: str) -> str:
 
 def build_happ_routing_link() -> str:
     routing = {
-        "Name": "VPN: TikTok через VPN, белый список напрямую",
+        "Name": "VPN: TikTok/YouTube через VPN, РФ напрямую",
         "GlobalProxy": "true",
         "RemoteDNSType": "DoH",
         "RemoteDNSDomain": "https://cloudflare-dns.com/dns-query",
@@ -526,10 +566,10 @@ def build_happ_routing_link() -> str:
             "cloudflare-dns.com": "1.1.1.1",
             "dns.yandex.ru": "77.88.8.8",
         },
-        "DirectSites": HAPP_ROUTING_DIRECT_SITES,
-        "DirectIp": HAPP_ROUTING_DIRECT_IPS,
-        "ProxySites": HAPP_ROUTING_PROXY_SITES,
+        "ProxySites": happ_proxy_sites(),
         "ProxyIp": [],
+        "DirectSites": happ_direct_sites(),
+        "DirectIp": HAPP_ROUTING_DIRECT_IPS,
         "BlockSites": [],
         "BlockIp": [],
         "DomainStrategy": "IPIfNonMatch",
@@ -1651,22 +1691,25 @@ def build_happ_setup_html(vpn_link: str) -> str:
         ".card{width:min(560px,92vw);padding:28px;border-radius:28px;background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.18);box-shadow:0 24px 80px rgba(0,0,0,.3);backdrop-filter:blur(18px)}"
         "h1{margin:0 0 12px;font-size:34px;line-height:1.05}.muted{color:rgba(255,255,255,.72);line-height:1.5}.steps{display:grid;gap:12px;margin-top:20px}"
         "a,button{display:block;text-align:center;text-decoration:none;border:0;border-radius:18px;padding:15px 16px;font:inherit;font-weight:700;color:#10201d;background:#f5f0d8;cursor:pointer}"
-        ".primary{background:#54d18c;color:#062018}.secondary{background:#d9edff}.small{font-size:13px;color:rgba(255,255,255,.62);word-break:break-word;margin-top:16px}"
+        ".primary{background:#54d18c;color:#062018}.secondary{background:#d9edff}.ghost{background:rgba(255,255,255,.16);color:#fff}.small{font-size:13px;color:rgba(255,255,255,.62);word-break:break-word;margin-top:16px}"
+        ".pulse{outline:3px solid rgba(84,209,140,.55);animation:p 1s infinite}@keyframes p{50%{outline-color:transparent}}"
         "</style>"
         "<script>"
         "const vpn=" + json.dumps(vpn_link) + ";"
         "const routing=" + json.dumps(routing_link) + ";"
-        "function openVpn(){location.href=vpn}"
-        "function openRouting(){location.href=routing}"
-        "window.addEventListener('load',()=>{setTimeout(openVpn,500);setTimeout(openRouting,2600);});"
+        "function openVpn(){sessionStorage.setItem('happ_setup_stage','vpn');location.href=vpn}"
+        "function openRouting(){sessionStorage.setItem('happ_setup_stage','routing');location.href=routing}"
+        "function startSetup(){openVpn();setTimeout(()=>{let b=document.getElementById('routingBtn');if(b)b.classList.add('pulse')},1600)}"
+        "window.addEventListener('load',()=>{setTimeout(()=>{document.getElementById('startBtn')?.classList.add('pulse')},450);});"
         "</script></head><body><main class=\"card\">"
         "<h1>Настраиваю Happ</h1>"
-        "<p class=\"muted\">Сейчас телефон попробует открыть Happ и добавить VPN-профиль. После этого вернись на эту страницу и нажми маршрутизацию, если она не применилась автоматически.</p>"
+        "<p class=\"muted\">Нажми зелёную кнопку. Телефон откроет Happ и добавит VPN-профиль. Потом вернись сюда и нажми маршрутизацию, если она не открылась сама.</p>"
         "<div class=\"steps\">"
-        "<a class=\"primary\" href=\"" + safe_vpn + "\">1. Добавить VPN-профиль в Happ</a>"
-        "<a class=\"secondary\" href=\"" + safe_routing + "\">2. Применить маршрутизацию TikTok/маркетплейсы</a>"
+        "<button id=\"startBtn\" class=\"primary\" onclick=\"startSetup()\">Добавить VPN в Happ</button>"
+        "<a id=\"routingBtn\" class=\"secondary\" href=\"" + safe_routing + "\">Применить маршрутизацию TikTok/YouTube/маркетплейсы</a>"
+        "<a class=\"ghost\" href=\"" + safe_vpn + "\">Только открыть VPN-профиль</a>"
         "</div>"
-        "<p class=\"small\">Если iPhone/Telegram запретил автоматический переход, нажми кнопки по очереди. Копировать ссылку больше не нужно.</p>"
+        "<p class=\"small\">Копировать ссылку не нужно. Если Telegram или iPhone блокирует автопереходы, нажми две кнопки по очереди: сначала VPN, потом маршрутизацию.</p>"
         "</main></body></html>"
     )
 
@@ -2601,11 +2644,11 @@ def happ_setup_markup(config: Config, vpn_link: str, fallback_markup: str | None
     if not setup_url:
         return fallback_markup
     rows = [
-        [{"text": "Добавить в Happ и применить маршрутизацию", "url": setup_url}],
+        [{"text": "Добавить в Happ без копирования", "url": setup_url}],
     ]
     routing_url = happ_routing_redirect_url(config)
     if routing_url:
-        rows.append([{"text": "Только обновить маршрутизацию Happ", "url": routing_url}])
+        rows.append([{"text": "Обновить маршрутизацию TikTok/YouTube", "url": routing_url}])
     if fallback_markup:
         try:
             rows.extend(json.loads(fallback_markup).get("inline_keyboard") or [])
@@ -3152,8 +3195,8 @@ def send_routing_instructions(bot: TelegramBot, config: Config, chat_id: int, re
     open_url = happ_routing_redirect_url(config)
     caption = (
         "Правила маршрутизации для Happ:\n\n"
-        "TikTok и его CDN будут идти через VPN.\n"
-        "Белый список будет идти напрямую, мимо VPN: российские сайты, банки, Яндекс, VK, Госуслуги, операторы, магазины, карты, Apple/Google-проверки сети и капчи.\n\n"
+        "TikTok, YouTube и их CDN будут идти через VPN.\n"
+        "Белый список будет идти напрямую, мимо VPN: российские сайты, банки, Яндекс, VK, Госуслуги, операторы, маркетплейсы, карты, Apple/Android-проверки сети и капчи.\n\n"
         "Это снижает тормоза, капчи и ошибки входа в банки. Если сайт не открывается, обнови маршрутизацию этой кнопкой ещё раз.\n\n"
         "Отсканируй QR через Happ или нажми кнопку ниже, чтобы открыть Happ."
     )
