@@ -369,7 +369,6 @@ HAPP_ROUTING_PROXY_SITES = [
 
 HAPP_ROUTING_DIRECT_IPS = [
     "geoip:private",
-    "geoip:ru",
 ]
 
 
@@ -490,6 +489,10 @@ def next_device_id(row: dict[str, Any]) -> int:
     while candidate in used:
         candidate += 1
     return candidate
+
+
+def reissue_email(chat_id: int | str, request_id: int, device_id: int = 1) -> str:
+    return f"tg-{chat_id}-{request_id}-d{device_id}-r{int(time.time())}"
 
 
 def price_list_text() -> str:
@@ -1209,7 +1212,14 @@ class Store:
             return request
         return None
 
-    def update_device(self, request_id: int, device_id: int, client_uuid: str, profile_type: str | None = None) -> dict[str, Any] | None:
+    def update_device(
+        self,
+        request_id: int,
+        device_id: int,
+        client_uuid: str,
+        profile_type: str | None = None,
+        client_email: str | None = None,
+    ) -> dict[str, Any] | None:
         data = self._read()
         now = utc_now_iso()
         for request in data["requests"]:
@@ -1221,6 +1231,8 @@ class Store:
                     continue
                 if profile_type:
                     device["profile_type"] = profile_type
+                if client_email:
+                    device["client_email"] = client_email
                 device["uuid"] = client_uuid
                 device["updated_at"] = now
                 if int(device_id) == 1:
@@ -1700,7 +1712,10 @@ def build_happ_setup_html(vpn_link: str) -> str:
         "function openVpn(){sessionStorage.setItem('happ_setup_stage','vpn');location.href=vpn}"
         "function openRouting(){sessionStorage.setItem('happ_setup_stage','routing');location.href=routing}"
         "function startSetup(){openVpn();setTimeout(()=>{let b=document.getElementById('routingBtn');if(b)b.classList.add('pulse')},1600)}"
-        "window.addEventListener('load',()=>{setTimeout(()=>{document.getElementById('startBtn')?.classList.add('pulse')},450);});"
+        "function maybeRouting(){if(sessionStorage.getItem('happ_setup_stage')==='vpn')setTimeout(openRouting,700)}"
+        "window.addEventListener('focus',maybeRouting);"
+        "document.addEventListener('visibilitychange',()=>{if(!document.hidden)maybeRouting()});"
+        "window.addEventListener('load',()=>{setTimeout(startSetup,650);setTimeout(()=>{document.getElementById('startBtn')?.classList.add('pulse')},1800);});"
         "</script></head><body><main class=\"card\">"
         "<h1>Настраиваю Happ</h1>"
         "<p class=\"muted\">Нажми зелёную кнопку. Телефон откроет Happ и добавит VPN-профиль. Потом вернись сюда и нажми маршрутизацию, если она не открылась сама.</p>"
@@ -2002,18 +2017,20 @@ def start_routing_web_server(config: Config, store: Store | None = None, manager
                     profile_type = str(payload.get("profile_type") or row.get("profile_type") or "default")
                     if not is_profile_type(profile_type):
                         profile_type = "default"
-                    client_email = str(row.get("client_email") or f"tg-{row['chat_id']}-{request_id}")
+                    old_client_email = str(row.get("client_email") or "")
+                    client_email = reissue_email(row["chat_id"], request_id)
                     client_uuid = str(uuid.uuid4())
                     link = build_vless_link(config, client_uuid, profile_type, f"VPN {request_id} {profile_short(profile_type)}")
                     manager.save_client(client_email, client_uuid)
                     manager.reset_profile_guard_binding(client_email)
-                    store.update_profile(request_id, profile_type, client_email, client_uuid)
                     if bot:
                         bot.send_message(
                             int(row["chat_id"]),
-                            f"Новая VPN-ссылка создана. Старая больше не работает.\n\n{link}",
+                            f"Новая VPN-ссылка создана и уже включена на сервере.\n\n{link}\n\nСтарая ссылка отключится через несколько секунд.",
                             happ_setup_markup(config, link),
                         )
+                    remove_old_client_after_reissue(manager, old_client_email)
+                    store.update_profile(request_id, profile_type, client_email, client_uuid)
                     self._send_json(200, {"ok": True, "message": f"Профиль #{request_id} перевыпущен как {profile_label(profile_type)}."})
                     return
                 self._send_json(400, {"ok": False, "error": "Неизвестное действие."})
@@ -2644,7 +2661,7 @@ def happ_setup_markup(config: Config, vpn_link: str, fallback_markup: str | None
     if not setup_url:
         return fallback_markup
     rows = [
-        [{"text": "Добавить в Happ без копирования", "url": setup_url}],
+        [{"text": "Настройка без копирования", "url": setup_url}],
     ]
     routing_url = happ_routing_redirect_url(config)
     if routing_url:
@@ -3015,6 +3032,17 @@ def enforce_device_limit(manager: XrayManager, store: Store, row: dict[str, Any]
     for device in removed:
         manager.remove_client(str(device["client_email"]))
     return store.prune_devices(int(row["id"]), limit)
+
+
+def remove_old_client_after_reissue(manager: XrayManager, old_client_email: str) -> None:
+    if not old_client_email:
+        return
+    # Give Telegram a moment to deliver the new link before the old one is removed.
+    time.sleep(5)
+    try:
+        manager.remove_client(old_client_email)
+    except Exception:
+        logging.warning("Could not remove old reissued Xray client %s", old_client_email, exc_info=True)
 
 
 def send_client_card(bot: TelegramBot, manager: XrayManager, chat_id: int, row: dict[str, Any], markup: str | None = None) -> None:
@@ -3656,7 +3684,8 @@ def handle_callback(
             bot.answer_callback_query(callback_id, "Устройство не найдено.")
             return
         profile_type = str(device.get("profile_type") or row.get("profile_type") or "default")
-        client_email = str(device["client_email"])
+        old_client_email = str(device["client_email"])
+        client_email = reissue_email(row["chat_id"], request_id, device_id)
         client_uuid = str(uuid.uuid4())
         label = f"VPN {request_id} D{device_id} {profile_short(profile_type)}"
         link = build_vless_link(config, client_uuid, profile_type, label)
@@ -3668,18 +3697,19 @@ def handle_callback(
             logging.exception("Failed to reissue VPN device")
             bot.send_message(user_chat_id, f"Не смог перевыпустить {device_label(device)}: {exc}", user_devices_markup(row, config))
             return
-        updated = store.update_device(request_id, device_id, client_uuid, profile_type)
-        if not updated:
-            bot.send_message(user_chat_id, "Ссылка обновлена на сервере, но не смог сохранить её в базе. Напиши админу.", user_devices_markup(row, config))
-            return
         bot.send_message(
             user_chat_id,
             f"Готово. Ссылка для {device_label(device)} перевыпущена.\n"
-            "Старая ссылка этого устройства больше не работает.\n\n"
+            "Новая ссылка уже включена. Старая ссылка отключится через несколько секунд.\n\n"
             "Новая VPN-ссылка:\n\n"
             + link,
-            happ_setup_markup(config, link, user_devices_markup(updated, config)),
+            happ_setup_markup(config, link),
         )
+        remove_old_client_after_reissue(manager, old_client_email)
+        updated = store.update_device(request_id, device_id, client_uuid, profile_type, client_email)
+        if not updated:
+            bot.send_message(user_chat_id, "Новая ссылка работает, но не смог сохранить её в базе. Напиши админу.", user_devices_markup(row, config))
+            return
         return
 
     if parts[0] == "show_change_plan":
@@ -4183,17 +4213,12 @@ def handle_callback(
             bot.answer_callback_query(callback_id, "Активный профиль не найден.")
             return
 
+        old_client_email = str(row.get("client_email") or "")
         client_uuid = str(uuid.uuid4())
-        client_email = str(row.get("client_email") or f"tg-{row['chat_id']}-{request_id}")
+        client_email = reissue_email(row["chat_id"], request_id)
         label = f"VPN {request_id} {profile_short(profile_type)}"
         link = build_vless_link(config, client_uuid, profile_type, label)
         bot.safe_answer_callback_query(callback_id, "Перевыпускаю ссылку...")
-        bot.send_message(
-            int(row["chat_id"]),
-            "Новая VPN-ссылка уже создана. Сейчас применяю её на сервере; старая ссылка может отключиться на несколько секунд.\n\n"
-            + link,
-            happ_setup_markup(config, link),
-        )
         try:
             manager.save_client(client_email, client_uuid)
             manager.reset_profile_guard_binding(client_email)
@@ -4207,8 +4232,16 @@ def handle_callback(
             )
             return
 
+        bot.send_message(
+            int(row["chat_id"]),
+            "Новая VPN-ссылка уже создана и включена на сервере.\n\n"
+            + link
+            + "\n\nСтарая ссылка отключится через несколько секунд.",
+            happ_setup_markup(config, link),
+        )
+        remove_old_client_after_reissue(manager, old_client_email)
         store.update_profile(request_id, profile_type, client_email, client_uuid)
-        bot.send_message(int(row["chat_id"]), "Готово. Новая VPN-ссылка применена на сервере. Старая ссылка больше не работает.")
+        bot.send_message(int(row["chat_id"]), "Готово. Старая ссылка отключена, новая ссылка активна.")
         bot.send_message(user_chat_id, f"Профиль #{request_id} перевыпущен как {profile_label(profile_type)}.")
         return
 
