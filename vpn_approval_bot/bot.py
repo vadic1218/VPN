@@ -341,6 +341,15 @@ HAPP_ROUTING_PROXY_SITES = [
     "domain:tiktokcdn.com",
     "domain:tiktokcdn-eu.com",
     "domain:tiktokv.com",
+    "domain:api.tiktokv.com",
+    "domain:api-va.tiktokv.com",
+    "domain:api16-normal-c-useast1a.tiktokv.com",
+    "domain:api16-normal-useast5.us.tiktokv.com",
+    "domain:api16-core-c-useast1a.tiktokv.com",
+    "domain:api19-core-c-useast1a.tiktokv.com",
+    "domain:mon.tiktokv.com",
+    "domain:log.tiktokv.com",
+    "domain:rtlog.tiktokv.com",
     "domain:tiktokrow-cdn.com",
     "domain:tiktokrow.com",
     "domain:tiktokmusic.app",
@@ -350,18 +359,34 @@ HAPP_ROUTING_PROXY_SITES = [
     "domain:ttwstatic.com",
     "domain:ttwebview.com",
     "domain:tiktokcdn.com.c.footprint.net",
+    "domain:tiktokcdn.com.c.worldfcdn2.com",
+    "domain:ttdns2.com",
+    "domain:ttdns2.com.c.bytefcdn-oversea.com",
+    "domain:ttwid.com",
     "domain:musical.ly",
     "domain:muscdn.com",
+    "domain:amemv.com",
+    "domain:trill.com",
     "domain:bytedance.com",
+    "domain:bytedance.net",
     "domain:byteoversea.com",
     "domain:byteoversea.net",
+    "domain:bytefcdn-oversea.com",
+    "domain:bytefcdn-ttpeu.com",
+    "domain:bytefcdn-ttpuseast.com",
+    "domain:bytefcdn-us.com",
     "domain:bytegecko-i18n.com",
+    "domain:byteintlapi.com",
+    "domain:byteintl.net",
+    "domain:byteoversea.net.c.bytefcdn-oversea.com",
     "domain:ibytedtos.com",
+    "domain:ibytedapm.com",
     "domain:ibyteimg.com",
     "domain:byteimg.com",
     "domain:bytecdn.cn",
     "domain:snssdk.com",
     "domain:isnssdk.com",
+    "domain:sgsnssdk.com",
     "domain:pstatp.com",
     "domain:capcut.com",
     "domain:capcutapi.com",
@@ -3225,7 +3250,8 @@ def send_routing_instructions(bot: TelegramBot, config: Config, chat_id: int, re
         "Правила маршрутизации для Happ:\n\n"
         "TikTok, YouTube и их CDN будут идти через VPN.\n"
         "Белый список будет идти напрямую, мимо VPN: российские сайты, банки, Яндекс, VK, Госуслуги, операторы, маркетплейсы, карты, Apple/Android-проверки сети и капчи.\n\n"
-        "Это снижает тормоза, капчи и ошибки входа в банки. Если сайт не открывается, обнови маршрутизацию этой кнопкой ещё раз.\n\n"
+        "Если TikTok показывает только старые ролики: обнови эти правила в Happ, затем полностью закрой TikTok и очисти кэш приложения.\n"
+        "Если лента всё равно не обновляется, проверь, что у TikTok выключен доступ к геолокации и приложение не использует регион/SIM как Россию.\n\n"
         "Отсканируй QR через Happ или нажми кнопку ниже, чтобы открыть Happ."
     )
     qr_source = happ_routing_qr_url(config) or qr_url_for_link(routing_link)
@@ -3303,7 +3329,8 @@ def handle_message(
             "Маршрутизация:\n"
             "1. Нажми «Моя подписка».\n"
             "2. Нажми кнопку маршрутизации Happ.\n"
-            "3. Добавь правила в Happ. TikTok пойдёт через VPN, а Яндекс, банки, VK и Госуслуги будут идти напрямую.\n\n"
+            "3. Добавь правила в Happ. TikTok и YouTube пойдут через VPN, а Яндекс, банки, VK, Госуслуги и маркетплейсы будут идти напрямую.\n"
+            "4. После обновления правил полностью закрой TikTok/YouTube и открой заново.\n\n"
             "Команды:\n"
             "/vpn - выбрать оператора и отправить заявку на VPN\n"
             "/vpn_status ID - проверить заявку\n"
