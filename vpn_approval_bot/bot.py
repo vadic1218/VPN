@@ -80,6 +80,7 @@ class Config:
     public_base_url: str
     web_port: int
     admin_web_token: str
+    bot_public_url: str
     public_telegram_proxy_url: str
     reserve_vpn_host: str
     public_issue_enabled: bool
@@ -776,6 +777,12 @@ def payment_payload(config: Config, payment_method: str = "sber") -> dict[str, A
     }
 
 
+def telegram_claim_url(config: Config, web_token: str) -> str:
+    if not config.bot_public_url or not web_token:
+        return ""
+    return f"{config.bot_public_url}?start=claim_{quote(web_token, safe='')}"
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -892,6 +899,7 @@ def load_config() -> Config:
         public_base_url=_get(raw, "PUBLIC_BASE_URL", default_public_base_url).rstrip("/"),
         web_port=int(_get(raw, "PORT", "0") or "0"),
         admin_web_token=_get(raw, "ADMIN_WEB_TOKEN"),
+        bot_public_url=_get(raw, "BOT_PUBLIC_URL").rstrip("/"),
         public_telegram_proxy_url=_get(raw, "PUBLIC_TELEGRAM_PROXY_URL"),
         reserve_vpn_host=_get(raw, "RESERVE_VPN_HOST"),
         public_issue_enabled=_get_bool(raw, "PUBLIC_ISSUE_ENABLED"),
@@ -2077,6 +2085,8 @@ def public_profile_payload(row: dict[str, Any], config: Config) -> dict[str, Any
         "routing_url": happ_routing_redirect_url(config) or build_happ_routing_link(),
         "claim_code": str(row.get("web_token") or ""),
         "web_token": str(row.get("web_token") or ""),
+        "telegram_claim_url": telegram_claim_url(config, str(row.get("web_token") or "")),
+        "telegram_linked": int(row.get("chat_id") or 0) > 0,
         "payment_status": str(row.get("payment_status") or ""),
         "payment_text": payment_text(config, request_id, row.get("plan_id"), profile_type, payment_method),
         "payment_qr_url": payment_qr_source(config, payment_method),
@@ -2109,6 +2119,7 @@ def build_public_vpn_html(config: Config) -> str:
             ],
             "defaultPayment": payment_payload(config),
             "telegramProxyUrl": config.public_telegram_proxy_url,
+            "botUrl": config.bot_public_url,
         },
         ensure_ascii=False,
     )
@@ -2162,7 +2173,8 @@ function toggleUsernameHelp(){{let on=$('noUsername').checked;$('usernameHelp').
 function selectedPayment(){{let id=$('paymentMethod').value;return (CFG.paymentMethods||[]).find(p=>p.id===id)||CFG.defaultPayment||{{}}}}
 function renderPayment(p){{let pay=p?{{label:p.payment_method_label||selectedPayment().label,link:p.payment_link,qr_url:p.payment_qr_url}}:selectedPayment();let plan=$('plan').options[$('plan').selectedIndex]?.text||'';let profile=$('profile').options[$('profile').selectedIndex]?.text||'';$('paymentBox').innerHTML=`<b>Оплата</b><br>Тариф: ${{plan}}<br>Оператор: ${{profile}}<br>Банк: ${{pay.label||'оплата'}}<br>${{pay.link?`<div class="actions"><a class="btn" href="${{pay.link}}" target="_blank">Открыть оплату</a></div>`:''}}${{pay.qr_url?`<img alt="QR оплаты" src="${{pay.qr_url}}" style="margin-top:14px;max-width:260px;width:100%;border-radius:8px;background:#fff;padding:8px">`:'QR появится после настройки PAYMENT_LINK или PAYMENT_QR_URL'}}`;}}
 function renderProxy(){{if(!CFG.telegramProxyUrl)return;$('proxyBox').classList.remove('hide');$('proxyBox').innerHTML=`<b>Telegram не открывается?</b><br>Используй запасной бесплатный вход в Telegram, потом вернись сюда и оформи VPN.<div class="actions"><a class="btn secondary" href="${{CFG.telegramProxyUrl}}" target="_blank">Открыть прокси Telegram</a></div>`}}
-function showProfile(p){{localStorage.setItem(tokenKey,p.web_token||localStorage.getItem(tokenKey)||'');renderPayment(p);$('setupBtn').href=p.happ_setup_url||'#';$('routingBtn').href=p.routing_url||'#';$('linkBox').classList.remove('hide');if(p.status==='approved'&&p.vpn_link){{$('setupBtn').classList.remove('hide');$('routingBtn').classList.remove('hide');$('reissueBtn').classList.remove('hide');$('linkBox').textContent=`Профиль #${{p.id}}\\n${{p.profile_label}}\\nПодписка до: ${{p.subscription_until||'-'}}\\nКод привязки к Telegram: /claim ${{p.claim_code||localStorage.getItem(tokenKey)||''}}\\n\\n${{p.vpn_link}}`;return}}$('setupBtn').classList.add('hide');$('routingBtn').classList.add('hide');$('reissueBtn').classList.add('hide');let paid=p.payment_status==='user_marked_paid'?'\\n\\nСтатус оплаты: отмечено как оплачено, ждём проверку администратора.':'\\n\\nПосле оплаты нажми кнопку ниже.';if(p.status==='approved'){{$('linkBox').textContent='Старая VPN-ссылка больше не активна. Если подписка закончилась или профиль отключён, обратись к администратору.';return}}$('linkBox').innerHTML=`<pre>${{p.payment_text||''}}${{paid}}\\n\\nДля привязки Telegram: /claim ${{p.claim_code||localStorage.getItem(tokenKey)||''}}</pre><div class="actions"><button class="secondary" onclick="markPaid()">Я оплатил</button></div>`;}}
+function telegramClaimHtml(p){{if(p.telegram_linked)return '<br>Telegram привязан.';let cmd='/claim '+(p.claim_code||localStorage.getItem(tokenKey)||'');let btn=p.telegram_claim_url?`<div class="actions"><a class="btn secondary" href="${{p.telegram_claim_url}}" target="_blank">Привязать Telegram</a></div>`:'';return `<br><br>Чтобы бот сам прислал конфигуратор в Telegram, открой бота и отправь:<br>${{cmd}}${{btn}}`}}
+function showProfile(p){{localStorage.setItem(tokenKey,p.web_token||localStorage.getItem(tokenKey)||'');renderPayment(p);$('setupBtn').href=p.happ_setup_url||'#';$('routingBtn').href=p.routing_url||'#';$('linkBox').classList.remove('hide');if(p.status==='approved'&&p.vpn_link){{$('setupBtn').classList.remove('hide');$('routingBtn').classList.remove('hide');$('reissueBtn').classList.remove('hide');$('linkBox').innerHTML=`<pre>Профиль #${{p.id}}\\n${{p.profile_label}}\\nПодписка до: ${{p.subscription_until||'-'}}\\n\\n${{p.vpn_link}}</pre>${{telegramClaimHtml(p)}}`;return}}$('setupBtn').classList.add('hide');$('routingBtn').classList.add('hide');$('reissueBtn').classList.add('hide');let paid=p.payment_status==='user_marked_paid'?'\\n\\nСтатус оплаты: отмечено как оплачено, ждём проверку администратора.':'\\n\\nПосле оплаты нажми кнопку ниже.';if(p.status==='approved'){{$('linkBox').textContent='Старая VPN-ссылка больше не активна. Если подписка закончилась или профиль отключён, обратись к администратору.';return}}$('linkBox').innerHTML=`<pre>${{p.payment_text||''}}${{paid}}</pre>${{telegramClaimHtml(p)}}<div class="actions"><button class="secondary" onclick="markPaid()">Я оплатил</button></div>`;}}
 async function issue(){{if($('noUsername').checked){{$('issueResult').classList.remove('hide');$('issueResult').textContent='Сначала создайте username в Telegram: Мой профиль -> Имя пользователя. Потом вернитесь и введите @username.';return}}$('issueBtn').disabled=true;$('issueResult').classList.remove('hide');$('issueResult').textContent='Создаю заявку...';try{{let d=await api('/api/public/issue',{{method:'POST',body:JSON.stringify({{name:$('name').value,contact:$('contact').value,plan_id:$('plan').value,profile_type:$('profile').value,payment_method:$('paymentMethod').value,access_token:$('accessToken').value,web_token:localStorage.getItem(tokenKey)||''}})}});localStorage.setItem(tokenKey,d.web_token);$('issueResult').textContent=d.created?'Заявка создана. Оплати и дождись проверки.':'У тебя уже есть активная или ожидающая заявка.';showProfile(d.profile)}}catch(e){{$('issueResult').textContent=e.message}}finally{{$('issueBtn').disabled=false}}}}
 async function markPaid(){{let t=localStorage.getItem(tokenKey)||'';if(!t)return;try{{let d=await api('/api/public/paid',{{method:'POST',body:JSON.stringify({{web_token:t}})}});showProfile(d.profile)}}catch(e){{$('linkBox').textContent=e.message}}}}
 async function reissue(){{let t=localStorage.getItem(tokenKey)||'';if(!t)return;try{{let d=await api('/api/public/reissue',{{method:'POST',body:JSON.stringify({{web_token:t}})}});showProfile(d.profile)}}catch(e){{$('linkBox').textContent=e.message}}}}
@@ -2307,6 +2319,9 @@ def start_routing_web_server(config: Config, store: Store | None = None, manager
                     row = store.get_request_by_web_token(token)
                     if not row:
                         self._send_json(404, {"ok": False, "error": "Профиль не найден в этом браузере."})
+                        return
+                    if row.get("status") in {"rejected", "disabled"}:
+                        self._send_json(410, {"ok": False, "error": "Профиль больше не активен."})
                         return
                     self._send_json(200, {"ok": True, "profile": public_profile_payload(row, config)})
                     return
@@ -3915,6 +3930,10 @@ def handle_message(
     if not chat_id or not text:
         return
 
+    if text.startswith("/start claim_"):
+        claim_token = text.split("claim_", 1)[1].strip().split()[0]
+        text = f"/claim {claim_token}"
+
     if text.startswith("/claim"):
         parts = text.split(maxsplit=1)
         if len(parts) != 2 or not parts[1].strip():
@@ -3924,6 +3943,9 @@ def handle_message(
         row = store.claim_web_profile(parts[1].strip(), chat_id, username, full_name)
         if not row:
             bot.send_message(chat_id, "Не нашёл профиль с таким кодом.")
+            return
+        if row.get("status") in {"rejected", "disabled"}:
+            bot.send_message(chat_id, "Этот профиль уже не активен. Оформи новую заявку на сайте.")
             return
         bot.send_message(
             chat_id,
