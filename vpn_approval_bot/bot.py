@@ -1049,6 +1049,9 @@ class Store:
                 request["plan_id"] = str(plan_id)
                 request["plan_devices"] = plan["devices"]
                 request["plan_price"] = plan["price"]
+                request["username"] = username or request.get("username") or "-"
+                request["contact_key"] = normalize_public_contact(username) if username else request.get("contact_key", "")
+                request["contact_keys"] = sorted(contact_keys(username)) if username else request.get("contact_keys", [])
                 self._write(data)
                 return int(request["id"])
 
@@ -1061,6 +1064,9 @@ class Store:
                 "username": username,
                 "full_name": full_name,
                 "status": "pending",
+                "source": "telegram",
+                "contact_key": normalize_public_contact(username) if username else "",
+                "contact_keys": sorted(contact_keys(username)) if username else [],
                 "profile_type": profile_type,
                 "plan_id": str(plan_id),
                 "plan_devices": plan["devices"],
@@ -2124,16 +2130,14 @@ def build_public_vpn_html(config: Config) -> str:
 </head>
 <body>
 <main class="wrap">
-<header><h1>VPN доступ</h1><div id="serverStatus" class="status">Проверяем сервер...</div></header>
+<header><h1>VPN кабинет</h1><div id="serverStatus" class="status">Проверяем сервер...</div></header>
 <div class="grid">
 <section>
-<h2>Оформить доступ</h2>
-<p class="muted">Сайт создаст заявку и реквизиты оплаты. VPN-ссылка появится здесь только после проверки оплаты администратором. На один контакт можно иметь только одну активную или ожидающую заявку.</p>
+<h2>Оформить VPN</h2>
+<p class="muted">Введи Telegram username, выбери тариф и оплату. После одобрения здесь появится VPN-ссылка и кнопка Happ.</p>
 <label>Имя</label><input id="name" placeholder="Как тебя записать">
 <label>Telegram username</label><input id="contact" placeholder="@username">
-<label class="check"><input id="noUsername" type="checkbox" onchange="toggleUsernameHelp()">У меня пока нет username</label>
-<p class="muted">Где найти: откройте Telegram -> Мой профиль -> Имя пользователя. Скопируйте имя в формате @username. Если username не задан, сначала создайте его в настройках Telegram. Телефон и почта не подходят: бот не может найти по ним человека.</p>
-<div id="usernameHelp" class="result hide">Сначала создайте username в Telegram: откройте Telegram -> Мой профиль -> Имя пользователя -> задайте имя. После этого вернитесь на сайт, снимите галочку и введите @username. Без username сайт не создаёт VPN-заявку, чтобы не выпускать дубли и не терять клиента.</div>
+<p class="muted">Где найти: Telegram -> Мой профиль -> Имя пользователя. Номер телефона и почта не подходят.</p>
 <label>Тариф</label><select id="plan"></select>
 <label>Оператор</label><select id="profile"></select>
 <label>Оплата</label><select id="paymentMethod"></select>
@@ -2142,8 +2146,8 @@ def build_public_vpn_html(config: Config) -> str:
 <div id="issueResult" class="result hide"></div>
 </section>
 <section>
-<h2>Моя заявка</h2>
-<p class="muted">Оплата всегда доступна здесь. После одобрения появятся кнопки Happ и сама VPN-ссылка.</p>
+<h2>Оплата и статус</h2>
+<p class="muted">QR, ссылка оплаты, статус сервера и твоя VPN-ссылка находятся здесь.</p>
 <div id="paymentBox" class="result"></div>
 <div id="proxyBox" class="result hide"></div>
 <div id="serverAlert" class="result hide"></div>
@@ -2158,12 +2162,11 @@ const tokenKey='vpnWebToken';
 function $(id){{return document.getElementById(id)}}
 function fill(){{CFG.plans.forEach(p=>$('plan').add(new Option(p.label,p.id)));CFG.profiles.forEach(p=>$('profile').add(new Option(p.label,p.id)));(CFG.paymentMethods||[]).forEach(p=>$('paymentMethod').add(new Option(p.label,p.id)));if(!($('paymentMethod').options.length))$('paymentMethod').add(new Option('Оплата администратору','sber'));if(CFG.requiresToken)$('tokenBox').classList.remove('hide');if(!CFG.enabled){{$('issueBtn').disabled=true;$('issueResult').classList.remove('hide');$('issueResult').textContent='Выпуск ссылок на сайте пока выключен.'}}}}
 async function api(path,opts={{}}){{let r=await fetch(path,Object.assign({{headers:{{'Content-Type':'application/json'}}}},opts));let d=await r.json();if(!r.ok||!d.ok)throw new Error(d.error||'Ошибка');return d}}
-function toggleUsernameHelp(){{let on=$('noUsername').checked;$('usernameHelp').classList.toggle('hide',!on);$('contact').disabled=on;if(on)$('contact').value=''}}
 function selectedPayment(){{let id=$('paymentMethod').value;return (CFG.paymentMethods||[]).find(p=>p.id===id)||CFG.defaultPayment||{{}}}}
 function renderPayment(p){{let pay=p?{{label:p.payment_method_label||selectedPayment().label,link:p.payment_link,qr_url:p.payment_qr_url}}:selectedPayment();let plan=$('plan').options[$('plan').selectedIndex]?.text||'';let profile=$('profile').options[$('profile').selectedIndex]?.text||'';$('paymentBox').innerHTML=`<b>Оплата</b><br>Тариф: ${{plan}}<br>Оператор: ${{profile}}<br>Банк: ${{pay.label||'оплата'}}<br>${{pay.link?`<div class="actions"><a class="btn" href="${{pay.link}}" target="_blank">Открыть оплату</a></div>`:''}}${{pay.qr_url?`<img alt="QR оплаты" src="${{pay.qr_url}}" style="margin-top:14px;max-width:260px;width:100%;border-radius:8px;background:#fff;padding:8px">`:'QR появится после настройки PAYMENT_LINK или PAYMENT_QR_URL'}}`;}}
 function renderProxy(){{if(!CFG.telegramProxyUrl)return;$('proxyBox').classList.remove('hide');$('proxyBox').innerHTML=`<b>Telegram не открывается?</b><br>Используй запасной бесплатный вход в Telegram, потом вернись сюда и оформи VPN.<div class="actions"><a class="btn secondary" href="${{CFG.telegramProxyUrl}}" target="_blank">Открыть прокси Telegram</a></div>`}}
 function showProfile(p){{localStorage.setItem(tokenKey,p.web_token||localStorage.getItem(tokenKey)||'');renderPayment(p);$('setupBtn').href=p.happ_setup_url||'#';$('routingBtn').href=p.routing_url||'#';$('linkBox').classList.remove('hide');if(p.status==='approved'&&p.vpn_link){{$('setupBtn').classList.remove('hide');$('routingBtn').classList.remove('hide');$('reissueBtn').classList.remove('hide');$('linkBox').innerHTML=`<pre>Профиль #${{p.id}}\\n${{p.profile_label}}\\nПодписка до: ${{p.subscription_until||'-'}}\\n\\n${{p.vpn_link}}</pre>`;return}}$('setupBtn').classList.add('hide');$('routingBtn').classList.add('hide');$('reissueBtn').classList.add('hide');let paid=p.payment_status==='user_marked_paid'?'\\n\\nСтатус оплаты: отмечено как оплачено, ждём проверку администратора.':'\\n\\nПосле оплаты нажми кнопку ниже.';if(p.status==='approved'){{$('linkBox').textContent='Старая VPN-ссылка больше не активна. Если подписка закончилась или профиль отключён, обратись к администратору.';return}}$('linkBox').innerHTML=`<pre>${{p.payment_text||''}}${{paid}}</pre><div class="actions"><button class="secondary" onclick="markPaid()">Я оплатил</button></div>`;}}
-async function issue(){{if($('noUsername').checked){{$('issueResult').classList.remove('hide');$('issueResult').textContent='Сначала создайте username в Telegram: Мой профиль -> Имя пользователя. Потом вернитесь и введите @username.';return}}$('issueBtn').disabled=true;$('issueResult').classList.remove('hide');$('issueResult').textContent='Создаю заявку...';try{{let d=await api('/api/public/issue',{{method:'POST',body:JSON.stringify({{name:$('name').value,contact:$('contact').value,plan_id:$('plan').value,profile_type:$('profile').value,payment_method:$('paymentMethod').value,access_token:$('accessToken').value,web_token:localStorage.getItem(tokenKey)||''}})}});localStorage.setItem(tokenKey,d.web_token);$('issueResult').textContent=d.created?'Заявка создана. Оплати и дождись проверки.':'У тебя уже есть активная или ожидающая заявка.';showProfile(d.profile)}}catch(e){{$('issueResult').textContent=e.message}}finally{{$('issueBtn').disabled=false}}}}
+async function issue(){{$('issueBtn').disabled=true;$('issueResult').classList.remove('hide');$('issueResult').textContent='Создаю заявку...';try{{let d=await api('/api/public/issue',{{method:'POST',body:JSON.stringify({{name:$('name').value,contact:$('contact').value,plan_id:$('plan').value,profile_type:$('profile').value,payment_method:$('paymentMethod').value,access_token:$('accessToken').value,web_token:localStorage.getItem(tokenKey)||''}})}});localStorage.setItem(tokenKey,d.web_token);$('issueResult').textContent=d.created?'Заявка создана. Оплати и дождись проверки.':'У тебя уже есть активная или ожидающая заявка.';showProfile(d.profile)}}catch(e){{$('issueResult').textContent=e.message}}finally{{$('issueBtn').disabled=false}}}}
 async function markPaid(){{let t=localStorage.getItem(tokenKey)||'';if(!t)return;try{{let d=await api('/api/public/paid',{{method:'POST',body:JSON.stringify({{web_token:t}})}});showProfile(d.profile)}}catch(e){{$('linkBox').textContent=e.message}}}}
 async function reissue(){{let t=localStorage.getItem(tokenKey)||'';if(!t)return;try{{let d=await api('/api/public/reissue',{{method:'POST',body:JSON.stringify({{web_token:t}})}});showProfile(d.profile)}}catch(e){{$('linkBox').textContent=e.message}}}}
 async function loadMine(){{renderPayment();renderProxy();let t=localStorage.getItem(tokenKey)||'';if(!t){{$('linkBox').classList.remove('hide');$('linkBox').textContent='В этом браузере еще нет выпущенной ссылки.';return}}try{{let d=await api('/api/public/me?token='+encodeURIComponent(t));showProfile(d.profile)}}catch(e){{localStorage.removeItem(tokenKey);$('linkBox').classList.remove('hide');$('linkBox').textContent='Старая ссылка убрана с сайта: профиль не найден или больше не активен.'}}}}
@@ -4431,6 +4434,21 @@ def handle_callback(
                 return
 
         username, full_name = user_display(from_user)
+        if not username:
+            bot.answer_callback_query(callback_id, "Нужен Telegram username.")
+            bot.send_message(
+                user_chat_id,
+                "Чтобы система не выдавала дубли, сначала создай username в Telegram: Мой профиль -> Имя пользователя. Потом снова нажми «Получить VPN».",
+            )
+            return
+        busy = store.find_busy_username(username)
+        if busy and int(busy.get("chat_id") or 0) != user_chat_id:
+            bot.answer_callback_query(callback_id, "VPN уже оформлен.")
+            bot.send_message(
+                user_chat_id,
+                "На твой Telegram username уже есть активная или ожидающая VPN-заявка. Вторую ссылку создать нельзя.",
+            )
+            return
         request_id = store.create_request(user_chat_id, username, full_name, profile_type, plan_id)
         selected_profile_label = profile_label(profile_type)
         selected_plan_label = plan_label(plan_id)
