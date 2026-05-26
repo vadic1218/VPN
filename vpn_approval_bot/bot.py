@@ -486,10 +486,41 @@ def normalize_public_contact(value: str) -> str:
     return normalized
 
 
+def normalize_phone(value: str) -> str:
+    digits = re.sub(r"\D+", "", value)
+    if len(digits) == 11 and digits.startswith("8"):
+        digits = "7" + digits[1:]
+    elif len(digits) == 10 and digits.startswith("9"):
+        digits = "7" + digits
+    elif len(digits) == 11 and digits.startswith("7"):
+        pass
+    else:
+        return ""
+    return f"+{digits}"
+
+
+def contact_keys(value: str) -> set[str]:
+    raw = value.strip()
+    compact = normalize_public_contact(raw)
+    keys = {compact} if compact else set()
+    phone = normalize_phone(raw)
+    if phone:
+        keys.add(phone)
+        keys.add(phone[1:])
+    if "@" in compact and "." in compact:
+        keys.add(compact)
+    return {key for key in keys if key}
+
+
 def chat_id_from_contact(value: str) -> int:
-    digits = re.sub(r"\D+", "", value.strip())
-    if len(digits) >= 6:
-        return int(digits)
+    raw = value.strip()
+    explicit = re.fullmatch(r"id[:\s-]*(\d{6,})", raw, flags=re.IGNORECASE)
+    if explicit:
+        return int(explicit.group(1))
+    if normalize_phone(raw):
+        return 0
+    if re.fullmatch(r"\d{6,}", raw):
+        return int(raw)
     return 0
 
 
@@ -1100,13 +1131,15 @@ class Store:
         now = utc_now_iso()
         plan = plan_info(plan_id)
         normalized_contact = normalize_public_contact(contact)
+        normalized_keys = sorted(contact_keys(contact))
         data = self._read()
-        known_chat_id = self._chat_id_for_contact(data, contact, normalized_contact)
+        known_chat_id = self._chat_id_for_contact(data, contact, normalized_keys)
         for request in reversed(data["requests"]):
             if request.get("status") not in {"pending", "approved"}:
                 continue
             same_token = web_token and str(request.get("web_token") or "") == web_token
-            same_contact = normalized_contact and str(request.get("contact_key") or "") == normalized_contact
+            existing_keys = self._request_contact_keys(request)
+            same_contact = bool(set(normalized_keys) & existing_keys)
             if not (same_token or same_contact):
                 continue
             if request.get("status") == "pending":
@@ -1118,6 +1151,7 @@ class Store:
                 request["full_name"] = display_name or request.get("full_name") or "Web user"
                 request["username"] = contact or request.get("username") or "web-user"
                 request["contact_key"] = normalized_contact
+                request["contact_keys"] = normalized_keys
                 request["updated_at"] = now
                 self._write(data)
             return request, False
@@ -1133,6 +1167,7 @@ class Store:
             "source": "web",
             "web_token": web_token,
             "contact_key": normalized_contact,
+            "contact_keys": normalized_keys,
             "profile_type": profile_type,
             "plan_id": str(plan_id),
             "plan_devices": plan["devices"],
@@ -1150,19 +1185,28 @@ class Store:
         return row, True
 
     @staticmethod
-    def _chat_id_for_contact(data: dict[str, Any], contact: str, normalized_contact: str) -> int:
+    def _request_contact_keys(request: dict[str, Any]) -> set[str]:
+        keys = set()
+        raw_keys = request.get("contact_keys")
+        if isinstance(raw_keys, list):
+            keys.update(str(item) for item in raw_keys if str(item or ""))
+        keys.update(contact_keys(str(request.get("contact_key") or "")))
+        keys.update(contact_keys(str(request.get("username") or "")))
+        return keys
+
+    @staticmethod
+    def _chat_id_for_contact(data: dict[str, Any], contact: str, normalized_keys: list[str]) -> int:
         direct_chat_id = chat_id_from_contact(contact)
         if direct_chat_id:
             return direct_chat_id
-        if not normalized_contact:
+        if not normalized_keys:
             return 0
+        wanted = set(normalized_keys)
         for request in reversed(data.get("requests", [])):
             chat_id = int(request.get("chat_id") or 0)
             if chat_id <= 0:
                 continue
-            username = normalize_public_contact(str(request.get("username") or ""))
-            contact_key = normalize_public_contact(str(request.get("contact_key") or ""))
-            if normalized_contact in {username, contact_key}:
+            if wanted & Store._request_contact_keys(request):
                 return chat_id
         return 0
 
@@ -2063,7 +2107,8 @@ def build_public_vpn_html(config: Config) -> str:
 <h2>Оформить доступ</h2>
 <p class="muted">Сайт создаст заявку и реквизиты оплаты. VPN-ссылка появится здесь только после проверки оплаты администратором. На один контакт можно иметь только одну активную или ожидающую заявку.</p>
 <label>Имя</label><input id="name" placeholder="Как тебя записать">
-<label>Контакт</label><input id="contact" placeholder="@username, телефон или почта">
+<label>Контакт</label><input id="contact" placeholder="@username, +79050122709, 89050122709 или mail@example.com">
+<p class="muted">Лучше писать слитно: @username, +79050122709, 89050122709, user@mail.ru. Также подойдут +7 905 012-27-09 и 8 (905) 012-27-09 - сайт сам приведёт телефон к виду +79050122709. Если знаешь Telegram chat id, пиши так: id:123456789.</p>
 <label>Тариф</label><select id="plan"></select>
 <label>Оператор</label><select id="profile"></select>
 <label>Оплата</label><select id="paymentMethod"></select>
