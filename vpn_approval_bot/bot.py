@@ -479,6 +479,24 @@ def restore_device_and_verify(manager: Any, config: Config, row: dict[str, Any],
     save_client_and_verify(manager, config, str(device["client_email"]), str(device["uuid"]), profile_type)
 
 
+def normalize_public_contact(value: str) -> str:
+    normalized = re.sub(r"\s+", "", value.strip().lower())
+    if normalized.startswith("@"):
+        normalized = normalized[1:]
+    return normalized
+
+
+def web_client_email(request_id: int) -> str:
+    return f"web-{request_id}-{uuid.uuid4().hex[:8]}"
+
+
+def approval_client_email(row: dict[str, Any], request_id: int) -> str:
+    chat_id = int(row.get("chat_id") or 0)
+    if chat_id > 0:
+        return f"tg-{chat_id}-{request_id}"
+    return web_client_email(request_id)
+
+
 def plan_info(plan_id: str | int | None) -> dict[str, int]:
     return SUBSCRIPTION_PLANS.get(str(plan_id or "1"), SUBSCRIPTION_PLANS["1"])
 
@@ -553,6 +571,8 @@ def next_device_id(row: dict[str, Any]) -> int:
 
 
 def reissue_email(chat_id: int | str, request_id: int, device_id: int = 1) -> str:
+    if int(chat_id or 0) <= 0:
+        return f"web-{request_id}-d{device_id}-r{int(time.time())}"
     return f"tg-{chat_id}-{request_id}-d{device_id}-r{int(time.time())}"
 
 
@@ -1060,6 +1080,62 @@ class Store:
         data["requests"].append(row)
         self._write(data)
         return row
+
+    def create_web_request(
+        self,
+        display_name: str,
+        contact: str,
+        profile_type: str,
+        plan_id: str,
+        web_token: str,
+    ) -> tuple[dict[str, Any], bool]:
+        now = utc_now_iso()
+        plan = plan_info(plan_id)
+        normalized_contact = normalize_public_contact(contact)
+        data = self._read()
+        for request in reversed(data["requests"]):
+            if request.get("status") not in {"pending", "approved"}:
+                continue
+            same_token = web_token and str(request.get("web_token") or "") == web_token
+            same_contact = normalized_contact and str(request.get("contact_key") or "") == normalized_contact
+            if not (same_token or same_contact):
+                continue
+            if request.get("status") == "pending":
+                request["profile_type"] = profile_type
+                request["plan_id"] = str(plan_id)
+                request["plan_devices"] = plan["devices"]
+                request["plan_price"] = plan["price"]
+                request["full_name"] = display_name or request.get("full_name") or "Web user"
+                request["username"] = contact or request.get("username") or "web-user"
+                request["contact_key"] = normalized_contact
+                request["updated_at"] = now
+                self._write(data)
+            return request, False
+
+        request_id = int(data.get("last_id", 0)) + 1
+        data["last_id"] = request_id
+        row = {
+            "id": request_id,
+            "chat_id": -request_id,
+            "username": contact or "web-user",
+            "full_name": display_name or contact or "Web user",
+            "status": "pending",
+            "source": "web",
+            "web_token": web_token,
+            "contact_key": normalized_contact,
+            "profile_type": profile_type,
+            "plan_id": str(plan_id),
+            "plan_devices": plan["devices"],
+            "plan_price": plan["price"],
+            "client_email": "",
+            "uuid": "",
+            "devices": [],
+            "created_at": now,
+            "decided_at": None,
+        }
+        data["requests"].append(row)
+        self._write(data)
+        return row, True
 
     def get_request_by_web_token(self, web_token: str) -> dict[str, Any] | None:
         if not web_token:
@@ -1876,18 +1952,25 @@ def public_profile_payload(row: dict[str, Any], config: Config) -> dict[str, Any
     if not is_profile_type(profile_type):
         profile_type = "default"
     label = f"VPN {row.get('id')} WEB {profile_short(profile_type)}"
-    link = build_vless_link(config, str(row.get("uuid") or ""), profile_type, label)
+    client_uuid = str(row.get("uuid") or "")
+    link = build_vless_link(config, client_uuid, profile_type, label) if client_uuid else ""
+    request_id = int(row.get("id") or 0)
+    payment_method = "sber"
     return {
-        "id": int(row.get("id") or 0),
+        "id": request_id,
         "status": str(row.get("status") or ""),
         "profile_type": profile_type,
         "profile_label": profile_label(profile_type),
         "plan": plan_label(row.get("plan_id")),
         "subscription_until": str(row.get("subscription_until") or ""),
         "vpn_link": link,
-        "happ_setup_url": happ_setup_url(config, link),
+        "happ_setup_url": happ_setup_url(config, link) if link else "",
         "routing_url": happ_routing_redirect_url(config) or build_happ_routing_link(),
         "claim_code": str(row.get("web_token") or ""),
+        "web_token": str(row.get("web_token") or ""),
+        "payment_text": payment_text(config, request_id, row.get("plan_id"), profile_type, payment_method),
+        "payment_qr_url": payment_qr_source(config, payment_method),
+        "payment_link": payment_method_info(config, payment_method).get("link") or "",
     }
 
 
@@ -1922,19 +2005,19 @@ def build_public_vpn_html(config: Config) -> str:
 <header><h1>VPN доступ</h1><div id="serverStatus" class="status">Проверяем сервер...</div></header>
 <div class="grid">
 <section>
-<h2>Выпустить ссылку</h2>
-<p class="muted">Ссылка создается на сервере и сохраняется в общей базе. Если потом открыть Telegram-бота, админ увидит этот профиль вместе с остальными.</p>
+<h2>Оформить доступ</h2>
+<p class="muted">Сайт создаст заявку и реквизиты оплаты. VPN-ссылка появится здесь только после проверки оплаты администратором. На один контакт можно иметь только одну активную или ожидающую заявку.</p>
 <label>Имя</label><input id="name" placeholder="Как тебя записать">
 <label>Контакт</label><input id="contact" placeholder="@username, телефон или почта">
 <label>Тариф</label><select id="plan"></select>
 <label>Оператор</label><select id="profile"></select>
 <div id="tokenBox" class="hide"><label>Код доступа</label><input id="accessToken" placeholder="Код от администратора"></div>
-<div class="actions"><button id="issueBtn" onclick="issue()">Создать VPN</button><button class="secondary" onclick="loadMine()">Показать мою ссылку</button></div>
+<div class="actions"><button id="issueBtn" onclick="issue()">Создать заявку</button><button class="secondary" onclick="loadMine()">Проверить заявку</button></div>
 <div id="issueResult" class="result hide"></div>
 </section>
 <section>
-<h2>Моя ссылка</h2>
-<p class="muted">Открой настройку Happ, затем примени маршрутизацию. Токен профиля хранится только в этом браузере.</p>
+<h2>Моя заявка</h2>
+<p class="muted">Пока заявка ожидает оплаты, здесь будут реквизиты. После одобрения появятся кнопки Happ и сама VPN-ссылка.</p>
 <div class="actions"><a id="setupBtn" class="btn hide" href="#">Открыть Happ</a><a id="routingBtn" class="btn secondary hide" href="#">Маршрутизация</a></div>
 <div id="linkBox" class="result hide"></div>
 </section>
@@ -1946,8 +2029,8 @@ const tokenKey='vpnWebToken';
 function $(id){{return document.getElementById(id)}}
 function fill(){{CFG.plans.forEach(p=>$('plan').add(new Option(p.label,p.id)));CFG.profiles.forEach(p=>$('profile').add(new Option(p.label,p.id)));if(CFG.requiresToken)$('tokenBox').classList.remove('hide');if(!CFG.enabled){{$('issueBtn').disabled=true;$('issueResult').classList.remove('hide');$('issueResult').textContent='Выпуск ссылок на сайте пока выключен.'}}}}
 async function api(path,opts={{}}){{let r=await fetch(path,Object.assign({{headers:{{'Content-Type':'application/json'}}}},opts));let d=await r.json();if(!r.ok||!d.ok)throw new Error(d.error||'Ошибка');return d}}
-function showProfile(p){{localStorage.setItem(tokenKey,p.web_token||localStorage.getItem(tokenKey)||'');$('setupBtn').href=p.happ_setup_url;$('routingBtn').href=p.routing_url;$('setupBtn').classList.remove('hide');$('routingBtn').classList.remove('hide');$('linkBox').classList.remove('hide');$('linkBox').textContent=`Профиль #${{p.id}}\\n${{p.profile_label}}\\nПодписка до: ${{p.subscription_until||'-'}}\\nКод привязки к Telegram: /claim ${{p.claim_code||localStorage.getItem(tokenKey)||''}}\\n\\n${{p.vpn_link}}`;}}
-async function issue(){{$('issueBtn').disabled=true;$('issueResult').classList.remove('hide');$('issueResult').textContent='Создаю профиль...';try{{let d=await api('/api/public/issue',{{method:'POST',body:JSON.stringify({{name:$('name').value,contact:$('contact').value,plan_id:$('plan').value,profile_type:$('profile').value,access_token:$('accessToken').value}})}});localStorage.setItem(tokenKey,d.web_token);$('issueResult').textContent='Готово. Ссылка создана.';showProfile(d.profile)}}catch(e){{$('issueResult').textContent=e.message}}finally{{$('issueBtn').disabled=false}}}}
+function showProfile(p){{localStorage.setItem(tokenKey,p.web_token||localStorage.getItem(tokenKey)||'');$('setupBtn').href=p.happ_setup_url||'#';$('routingBtn').href=p.routing_url||'#';$('linkBox').classList.remove('hide');if(p.status==='approved'&&p.vpn_link){{$('setupBtn').classList.remove('hide');$('routingBtn').classList.remove('hide');$('linkBox').textContent=`Профиль #${{p.id}}\\n${{p.profile_label}}\\nПодписка до: ${{p.subscription_until||'-'}}\\nКод привязки к Telegram: /claim ${{p.claim_code||localStorage.getItem(tokenKey)||''}}\\n\\n${{p.vpn_link}}`;return}}$('setupBtn').classList.add('hide');$('routingBtn').classList.add('hide');$('linkBox').textContent=`Заявка #${{p.id}} ожидает оплаты и проверки.\\n${{p.profile_label}}\\n${{p.plan}}\\n\\n${{p.payment_text||''}}`;}}
+async function issue(){{$('issueBtn').disabled=true;$('issueResult').classList.remove('hide');$('issueResult').textContent='Создаю заявку...';try{{let d=await api('/api/public/issue',{{method:'POST',body:JSON.stringify({{name:$('name').value,contact:$('contact').value,plan_id:$('plan').value,profile_type:$('profile').value,access_token:$('accessToken').value,web_token:localStorage.getItem(tokenKey)||''}})}});localStorage.setItem(tokenKey,d.web_token);$('issueResult').textContent=d.created?'Заявка создана. Оплати и дождись проверки.':'У тебя уже есть активная или ожидающая заявка.';showProfile(d.profile)}}catch(e){{$('issueResult').textContent=e.message}}finally{{$('issueBtn').disabled=false}}}}
 async function loadMine(){{let t=localStorage.getItem(tokenKey)||'';if(!t){{$('linkBox').classList.remove('hide');$('linkBox').textContent='В этом браузере еще нет выпущенной ссылки.';return}}try{{let d=await api('/api/public/me?token='+encodeURIComponent(t));showProfile(d.profile)}}catch(e){{$('linkBox').classList.remove('hide');$('linkBox').textContent=e.message}}}}
 async function loadStatus(){{try{{let d=await api('/api/public/server');$('serverStatus').textContent=d.summary}}catch(e){{$('serverStatus').textContent='Сервер недоступен'}}}}
 fill();loadMine();loadStatus();
@@ -2120,34 +2203,34 @@ def start_routing_web_server(config: Config, store: Store | None = None, manager
                     plan_id = "1"
                 display_name = str(payload.get("name") or "").strip()[:80]
                 contact = str(payload.get("contact") or "").strip()[:80]
-                client_uuid = str(uuid.uuid4())
-                client_email = f"web-{int(time.time())}-{uuid.uuid4().hex[:8]}"
-                save_client_and_verify(manager, config, client_email, client_uuid, profile_type)
-                web_token = uuid.uuid4().hex
-                row = store.create_web_profile(
+                if not contact:
+                    self._send_json(400, {"ok": False, "error": "Укажи контакт: Telegram username, телефон или почту."})
+                    return
+                web_token = str(payload.get("web_token") or "").strip()
+                if not re.fullmatch(r"[a-f0-9]{32}", web_token):
+                    web_token = uuid.uuid4().hex
+                row, created = store.create_web_request(
                     display_name,
                     contact,
                     profile_type,
                     plan_id,
-                    client_email,
-                    client_uuid,
                     web_token,
-                    config.default_subscription_days,
                 )
                 if bot:
                     text = (
-                        f"Сайт выпустил VPN-профиль #{row['id']}.\n"
+                        f"Новая заявка с сайта #{row['id']}.\n"
                         f"Контакт: {contact or '-'}\n"
                         f"Имя: {display_name or '-'}\n"
                         f"Оператор: {profile_label(profile_type)}\n"
-                        f"Тариф: {plan_label(plan_id)}"
+                        f"Тариф: {plan_label(plan_id)}\n"
+                        f"Статус: ожидает оплаты/проверки"
                     )
                     for admin_chat_id in config.admin_chat_ids:
                         try:
-                            bot.send_message(admin_chat_id, text, admin_client_markup(row))
+                            bot.send_message(admin_chat_id, text, admin_request_markup(int(row["id"])))
                         except Exception:
-                            logging.exception("Could not notify admin about public web profile")
-                self._send_json(200, {"ok": True, "web_token": web_token, "profile": public_profile_payload(row, config)})
+                            logging.exception("Could not notify admin about public web request")
+                self._send_json(200, {"ok": True, "created": created, "web_token": web_token, "profile": public_profile_payload(row, config)})
             except Exception as exc:
                 logging.exception("Public web issue failed")
                 self._send_json(500, {"ok": False, "error": str(exc)})
@@ -2243,7 +2326,7 @@ def start_routing_web_server(config: Config, store: Store | None = None, manager
                     if not is_profile_type(profile_type):
                         profile_type = "default"
                     client_uuid = str(uuid.uuid4())
-                    client_email = f"tg-{row['chat_id']}-{request_id}"
+                    client_email = approval_client_email(row, request_id)
                     save_client_and_verify(manager, config, client_email, client_uuid, profile_type)
                     store.finish_request(request_id, "approved", profile_type, client_email, client_uuid, config.default_subscription_days)
                     link = build_vless_link(config, client_uuid, profile_type, f"VPN {request_id} {profile_short(profile_type)}")
@@ -3337,7 +3420,7 @@ def send_admin_result(bot: TelegramBot, admin_chat_id: int, user_chat_id: int, u
         bot.send_message(admin_chat_id, user_text)
         return
     if user_chat_id <= 0:
-        bot.send_message(admin_chat_id, admin_text)
+        bot.send_message(admin_chat_id, admin_text + "\nПользователь получит ссылку на сайте после обновления заявки.")
         return
     bot.send_message(user_chat_id, user_text)
     bot.send_message(admin_chat_id, admin_text)
@@ -4617,7 +4700,7 @@ def handle_callback(
         selected_plan_label = plan_label(row.get("plan_id"))
 
         client_uuid = str(uuid.uuid4())
-        client_email = f"tg-{row['chat_id']}-{request_id}"
+        client_email = approval_client_email(row, request_id)
         bot.safe_answer_callback_query(callback_id, "Создаю профиль...")
         try:
             save_client_and_verify(manager, config, client_email, client_uuid, profile_type)
