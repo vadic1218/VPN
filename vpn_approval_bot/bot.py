@@ -506,6 +506,13 @@ def chat_id_from_contact(value: str) -> int:
     return 0
 
 
+def is_subscription_active(row: dict[str, Any]) -> bool:
+    if row.get("status") != "approved":
+        return False
+    until = parse_iso_time(str(row.get("subscription_until") or ""))
+    return until is None or until > datetime.now(timezone.utc)
+
+
 def web_client_email(request_id: int) -> str:
     return f"web-{request_id}-{uuid.uuid4().hex[:8]}"
 
@@ -1121,7 +1128,7 @@ class Store:
                 continue
             same_token = web_token and str(request.get("web_token") or "") == web_token
             existing_keys = self._request_contact_keys(request)
-            same_contact = bool(set(normalized_keys) & existing_keys)
+            same_contact = bool(set(normalized_keys) & existing_keys) and (request.get("status") == "pending" or is_subscription_active(request))
             if not (same_token or same_contact):
                 continue
             if request.get("status") == "pending":
@@ -1165,6 +1172,20 @@ class Store:
         data["requests"].append(row)
         self._write(data)
         return row, True
+
+    def find_busy_username(self, username: str, web_token: str = "") -> dict[str, Any] | None:
+        normalized_keys = contact_keys(username)
+        if not normalized_keys:
+            return None
+        data = self._read()
+        for request in reversed(data["requests"]):
+            if web_token and str(request.get("web_token") or "") == web_token:
+                continue
+            if not (normalized_keys & self._request_contact_keys(request)):
+                continue
+            if request.get("status") == "pending" or is_subscription_active(request):
+                return request
+        return None
 
     @staticmethod
     def _request_contact_keys(request: dict[str, Any]) -> set[str]:
@@ -2078,7 +2099,7 @@ def build_public_vpn_html(config: Config) -> str:
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>VPN доступ</title>
 <style>
-*{{box-sizing:border-box}}body{{margin:0;min-height:100vh;background:#101823;color:#f8fafc;font-family:Inter,Segoe UI,Arial,sans-serif}}.wrap{{width:min(1040px,100%);margin:auto;padding:28px 18px 42px}}header{{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:22px}}h1{{font-size:clamp(30px,6vw,58px);line-height:1;margin:0}}.status{{padding:9px 12px;border-radius:8px;background:#223044;color:#bad3ef}}.grid{{display:grid;grid-template-columns:1fr 1fr;gap:18px}}section{{padding:20px;border:1px solid #2c3b52;background:#172231;border-radius:8px}}label{{display:block;margin:12px 0 7px;color:#bdd1e8}}input,select{{width:100%;border:1px solid #3c5270;background:#0f1722;color:#fff;border-radius:8px;padding:13px;font:inherit}}button,a.btn{{display:inline-flex;align-items:center;justify-content:center;min-height:46px;border:0;border-radius:8px;padding:12px 16px;font:inherit;font-weight:700;background:#6d77ff;color:#fff;text-decoration:none;cursor:pointer}}button.secondary,a.secondary{{background:#25354b}}button:disabled{{opacity:.55;cursor:not-allowed}}.actions{{display:flex;flex-wrap:wrap;gap:10px;margin-top:16px}}.muted{{color:#91a8c2;line-height:1.5}}.result{{word-break:break-word;white-space:pre-wrap;background:#0c131d;border:1px solid #26364c;padding:14px;border-radius:8px;margin-top:14px}}.hide{{display:none}}@media(max-width:760px){{.grid{{grid-template-columns:1fr}}header{{align-items:flex-start;flex-direction:column}}}}
+*{{box-sizing:border-box}}body{{margin:0;min-height:100vh;background:#101823;color:#f8fafc;font-family:Inter,Segoe UI,Arial,sans-serif}}.wrap{{width:min(1040px,100%);margin:auto;padding:28px 18px 42px}}header{{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:22px}}h1{{font-size:clamp(30px,6vw,58px);line-height:1;margin:0}}.status{{padding:9px 12px;border-radius:8px;background:#223044;color:#bad3ef}}.grid{{display:grid;grid-template-columns:1fr 1fr;gap:18px}}section{{padding:20px;border:1px solid #2c3b52;background:#172231;border-radius:8px}}label{{display:block;margin:12px 0 7px;color:#bdd1e8}}input,select{{width:100%;border:1px solid #3c5270;background:#0f1722;color:#fff;border-radius:8px;padding:13px;font:inherit}}.check{{display:flex;align-items:center;gap:10px;margin-top:12px;color:#bdd1e8}}.check input{{width:auto}}button,a.btn{{display:inline-flex;align-items:center;justify-content:center;min-height:46px;border:0;border-radius:8px;padding:12px 16px;font:inherit;font-weight:700;background:#6d77ff;color:#fff;text-decoration:none;cursor:pointer}}button.secondary,a.secondary{{background:#25354b}}button:disabled{{opacity:.55;cursor:not-allowed}}.actions{{display:flex;flex-wrap:wrap;gap:10px;margin-top:16px}}.muted{{color:#91a8c2;line-height:1.5}}.result{{word-break:break-word;white-space:pre-wrap;background:#0c131d;border:1px solid #26364c;padding:14px;border-radius:8px;margin-top:14px}}.hide{{display:none}}@media(max-width:760px){{.grid{{grid-template-columns:1fr}}header{{align-items:flex-start;flex-direction:column}}}}
 </style>
 </head>
 <body>
@@ -2090,7 +2111,9 @@ def build_public_vpn_html(config: Config) -> str:
 <p class="muted">Сайт создаст заявку и реквизиты оплаты. VPN-ссылка появится здесь только после проверки оплаты администратором. На один контакт можно иметь только одну активную или ожидающую заявку.</p>
 <label>Имя</label><input id="name" placeholder="Как тебя записать">
 <label>Telegram username</label><input id="contact" placeholder="@username">
-<p class="muted">Где найти: открой Telegram -> Настройки -> Имя пользователя. Скопируй имя в формате @username. Если username не задан, сначала создай его в настройках Telegram. Телефон и почта не подходят: бот не может найти по ним человека.</p>
+<label class="check"><input id="noUsername" type="checkbox" onchange="toggleUsernameHelp()">У меня пока нет username</label>
+<p class="muted">Где найти: откройте Telegram -> Мой профиль -> Имя пользователя. Скопируйте имя в формате @username. Если username не задан, сначала создайте его в настройках Telegram. Телефон и почта не подходят: бот не может найти по ним человека.</p>
+<div id="usernameHelp" class="result hide">Сначала создайте username в Telegram: откройте Telegram -> Мой профиль -> Имя пользователя -> задайте имя. После этого вернитесь на сайт, снимите галочку и введите @username. Без username сайт не создаёт VPN-заявку, чтобы не выпускать дубли и не терять клиента.</div>
 <label>Тариф</label><select id="plan"></select>
 <label>Оператор</label><select id="profile"></select>
 <label>Оплата</label><select id="paymentMethod"></select>
@@ -2112,8 +2135,9 @@ const tokenKey='vpnWebToken';
 function $(id){{return document.getElementById(id)}}
 function fill(){{CFG.plans.forEach(p=>$('plan').add(new Option(p.label,p.id)));CFG.profiles.forEach(p=>$('profile').add(new Option(p.label,p.id)));(CFG.paymentMethods||[]).forEach(p=>$('paymentMethod').add(new Option(p.label,p.id)));if(!($('paymentMethod').options.length))$('paymentMethod').add(new Option('Оплата администратору','sber'));if(CFG.requiresToken)$('tokenBox').classList.remove('hide');if(!CFG.enabled){{$('issueBtn').disabled=true;$('issueResult').classList.remove('hide');$('issueResult').textContent='Выпуск ссылок на сайте пока выключен.'}}}}
 async function api(path,opts={{}}){{let r=await fetch(path,Object.assign({{headers:{{'Content-Type':'application/json'}}}},opts));let d=await r.json();if(!r.ok||!d.ok)throw new Error(d.error||'Ошибка');return d}}
+function toggleUsernameHelp(){{let on=$('noUsername').checked;$('usernameHelp').classList.toggle('hide',!on);$('contact').disabled=on;if(on)$('contact').value=''}}
 function showProfile(p){{localStorage.setItem(tokenKey,p.web_token||localStorage.getItem(tokenKey)||'');$('setupBtn').href=p.happ_setup_url||'#';$('routingBtn').href=p.routing_url||'#';$('linkBox').classList.remove('hide');if(p.status==='approved'&&p.vpn_link){{$('setupBtn').classList.remove('hide');$('routingBtn').classList.remove('hide');$('linkBox').textContent=`Профиль #${{p.id}}\\n${{p.profile_label}}\\nПодписка до: ${{p.subscription_until||'-'}}\\nКод привязки к Telegram: /claim ${{p.claim_code||localStorage.getItem(tokenKey)||''}}\\n\\n${{p.vpn_link}}`;return}}$('setupBtn').classList.add('hide');$('routingBtn').classList.add('hide');let paid=p.payment_status==='user_marked_paid'?'\\n\\nСтатус оплаты: отмечено как оплачено, ждём проверку администратора.':'\\n\\nПосле оплаты нажми кнопку ниже.';$('linkBox').innerHTML=`<pre>${{p.payment_text||''}}${{paid}}\\n\\nДля привязки Telegram: /claim ${{p.claim_code||localStorage.getItem(tokenKey)||''}}</pre>${{p.payment_link?`<div class="actions"><a class="btn" href="${{p.payment_link}}" target="_blank">Открыть оплату</a><button class="secondary" onclick="markPaid()">Я оплатил</button></div>`:`<div class="actions"><button class="secondary" onclick="markPaid()">Я оплатил</button></div>`}}${{p.payment_qr_url?`<img alt="QR оплаты" src="${{p.payment_qr_url}}" style="margin-top:14px;max-width:260px;width:100%;border-radius:8px;background:#fff;padding:8px">`:''}}`;}}
-async function issue(){{$('issueBtn').disabled=true;$('issueResult').classList.remove('hide');$('issueResult').textContent='Создаю заявку...';try{{let d=await api('/api/public/issue',{{method:'POST',body:JSON.stringify({{name:$('name').value,contact:$('contact').value,plan_id:$('plan').value,profile_type:$('profile').value,payment_method:$('paymentMethod').value,access_token:$('accessToken').value,web_token:localStorage.getItem(tokenKey)||''}})}});localStorage.setItem(tokenKey,d.web_token);$('issueResult').textContent=d.created?'Заявка создана. Оплати и дождись проверки.':'У тебя уже есть активная или ожидающая заявка.';showProfile(d.profile)}}catch(e){{$('issueResult').textContent=e.message}}finally{{$('issueBtn').disabled=false}}}}
+async function issue(){{if($('noUsername').checked){{$('issueResult').classList.remove('hide');$('issueResult').textContent='Сначала создайте username в Telegram: Мой профиль -> Имя пользователя. Потом вернитесь и введите @username.';return}}$('issueBtn').disabled=true;$('issueResult').classList.remove('hide');$('issueResult').textContent='Создаю заявку...';try{{let d=await api('/api/public/issue',{{method:'POST',body:JSON.stringify({{name:$('name').value,contact:$('contact').value,plan_id:$('plan').value,profile_type:$('profile').value,payment_method:$('paymentMethod').value,access_token:$('accessToken').value,web_token:localStorage.getItem(tokenKey)||''}})}});localStorage.setItem(tokenKey,d.web_token);$('issueResult').textContent=d.created?'Заявка создана. Оплати и дождись проверки.':'У тебя уже есть активная или ожидающая заявка.';showProfile(d.profile)}}catch(e){{$('issueResult').textContent=e.message}}finally{{$('issueBtn').disabled=false}}}}
 async function markPaid(){{let t=localStorage.getItem(tokenKey)||'';if(!t)return;try{{let d=await api('/api/public/paid',{{method:'POST',body:JSON.stringify({{web_token:t}})}});showProfile(d.profile)}}catch(e){{$('linkBox').textContent=e.message}}}}
 async function loadMine(){{let t=localStorage.getItem(tokenKey)||'';if(!t){{$('linkBox').classList.remove('hide');$('linkBox').textContent='В этом браузере еще нет выпущенной ссылки.';return}}try{{let d=await api('/api/public/me?token='+encodeURIComponent(t));showProfile(d.profile)}}catch(e){{$('linkBox').classList.remove('hide');$('linkBox').textContent=e.message}}}}
 async function loadStatus(){{try{{let d=await api('/api/public/server');$('serverStatus').textContent=d.summary}}catch(e){{$('serverStatus').textContent='Сервер недоступен'}}}}
@@ -2323,6 +2347,14 @@ def start_routing_web_server(config: Config, store: Store | None = None, manager
                 web_token = str(payload.get("web_token") or "").strip()
                 if not re.fullmatch(r"[a-f0-9]{32}", web_token):
                     web_token = uuid.uuid4().hex
+                busy = store.find_busy_username(contact, web_token)
+                if busy:
+                    if busy.get("status") == "pending":
+                        error = "На этот Telegram username уже есть ожидающая заявка. Новую создать нельзя."
+                    else:
+                        error = "На этот Telegram username уже есть активная VPN-подписка. Новую конфигурацию создать нельзя."
+                    self._send_json(409, {"ok": False, "error": error})
+                    return
                 row, created = store.create_web_request(
                     display_name,
                     contact,
