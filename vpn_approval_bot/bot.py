@@ -80,6 +80,7 @@ class Config:
     public_base_url: str
     web_port: int
     admin_web_token: str
+    public_telegram_proxy_url: str
     reserve_vpn_host: str
     public_issue_enabled: bool
     public_issue_token: str
@@ -761,6 +762,20 @@ def payment_qr_source(config: Config, payment_method: str) -> str:
     return ""
 
 
+def payment_payload(config: Config, payment_method: str = "sber") -> dict[str, Any]:
+    if payment_method not in payment_methods(config):
+        payment_method = next(iter(payment_methods(config)), "sber")
+    method = payment_method_info(config, payment_method)
+    return {
+        "id": payment_method,
+        "label": method.get("label") or config.payment_banks,
+        "link": method.get("link") or "",
+        "qr_url": payment_qr_source(config, payment_method),
+        "recipient": config.payment_recipient,
+        "banks": config.payment_banks,
+    }
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -877,6 +892,7 @@ def load_config() -> Config:
         public_base_url=_get(raw, "PUBLIC_BASE_URL", default_public_base_url).rstrip("/"),
         web_port=int(_get(raw, "PORT", "0") or "0"),
         admin_web_token=_get(raw, "ADMIN_WEB_TOKEN"),
+        public_telegram_proxy_url=_get(raw, "PUBLIC_TELEGRAM_PROXY_URL"),
         reserve_vpn_host=_get(raw, "RESERVE_VPN_HOST"),
         public_issue_enabled=_get_bool(raw, "PUBLIC_ISSUE_ENABLED"),
         public_issue_token=_get(raw, "PUBLIC_ISSUE_TOKEN"),
@@ -2043,7 +2059,7 @@ def public_profile_payload(row: dict[str, Any], config: Config) -> dict[str, Any
         profile_type = "default"
     label = f"VPN {row.get('id')} WEB {profile_short(profile_type)}"
     client_uuid = str(row.get("uuid") or "")
-    link = build_vless_link(config, client_uuid, profile_type, label) if client_uuid else ""
+    link = build_vless_link(config, client_uuid, profile_type, label) if client_uuid and is_subscription_active(row) else ""
     request_id = int(row.get("id") or 0)
     payment_method = str(row.get("payment_method") or "sber")
     if payment_method not in payment_methods(config):
@@ -2065,6 +2081,8 @@ def public_profile_payload(row: dict[str, Any], config: Config) -> dict[str, Any
         "payment_text": payment_text(config, request_id, row.get("plan_id"), profile_type, payment_method),
         "payment_qr_url": payment_qr_source(config, payment_method),
         "payment_link": payment_method_info(config, payment_method).get("link") or "",
+        "payment_method_label": payment_method_info(config, payment_method).get("label") or config.payment_banks,
+        "can_reissue": bool(link),
         "payment_methods": [
             {"id": key, "label": value["label"], "link": value.get("link") or ""}
             for key, value in methods.items()
@@ -2086,9 +2104,11 @@ def build_public_vpn_html(config: Config) -> str:
             "requiresToken": bool(config.public_issue_token),
             "enabled": config.public_issue_enabled,
             "paymentMethods": [
-                {"id": key, "label": value["label"]}
+                {"id": key, "label": value["label"], "link": value.get("link") or "", "qr_url": payment_qr_source(config, key)}
                 for key, value in payment_methods(config).items()
             ],
+            "defaultPayment": payment_payload(config),
+            "telegramProxyUrl": config.public_telegram_proxy_url,
         },
         ensure_ascii=False,
     )
@@ -2123,8 +2143,11 @@ def build_public_vpn_html(config: Config) -> str:
 </section>
 <section>
 <h2>Моя заявка</h2>
-<p class="muted">Пока заявка ожидает оплаты, здесь будут реквизиты. После одобрения появятся кнопки Happ и сама VPN-ссылка.</p>
-<div class="actions"><a id="setupBtn" class="btn hide" href="#">Открыть Happ</a><a id="routingBtn" class="btn secondary hide" href="#">Маршрутизация</a></div>
+<p class="muted">Оплата всегда доступна здесь. После одобрения появятся кнопки Happ и сама VPN-ссылка.</p>
+<div id="paymentBox" class="result"></div>
+<div id="proxyBox" class="result hide"></div>
+<div id="serverAlert" class="result hide"></div>
+<div class="actions"><a id="setupBtn" class="btn hide" href="#">Открыть Happ</a><a id="routingBtn" class="btn secondary hide" href="#">Маршрутизация</a><button id="reissueBtn" class="secondary hide" onclick="reissue()">Перевыпустить ссылку</button></div>
 <div id="linkBox" class="result hide"></div>
 </section>
 </div>
@@ -2136,12 +2159,16 @@ function $(id){{return document.getElementById(id)}}
 function fill(){{CFG.plans.forEach(p=>$('plan').add(new Option(p.label,p.id)));CFG.profiles.forEach(p=>$('profile').add(new Option(p.label,p.id)));(CFG.paymentMethods||[]).forEach(p=>$('paymentMethod').add(new Option(p.label,p.id)));if(!($('paymentMethod').options.length))$('paymentMethod').add(new Option('Оплата администратору','sber'));if(CFG.requiresToken)$('tokenBox').classList.remove('hide');if(!CFG.enabled){{$('issueBtn').disabled=true;$('issueResult').classList.remove('hide');$('issueResult').textContent='Выпуск ссылок на сайте пока выключен.'}}}}
 async function api(path,opts={{}}){{let r=await fetch(path,Object.assign({{headers:{{'Content-Type':'application/json'}}}},opts));let d=await r.json();if(!r.ok||!d.ok)throw new Error(d.error||'Ошибка');return d}}
 function toggleUsernameHelp(){{let on=$('noUsername').checked;$('usernameHelp').classList.toggle('hide',!on);$('contact').disabled=on;if(on)$('contact').value=''}}
-function showProfile(p){{localStorage.setItem(tokenKey,p.web_token||localStorage.getItem(tokenKey)||'');$('setupBtn').href=p.happ_setup_url||'#';$('routingBtn').href=p.routing_url||'#';$('linkBox').classList.remove('hide');if(p.status==='approved'&&p.vpn_link){{$('setupBtn').classList.remove('hide');$('routingBtn').classList.remove('hide');$('linkBox').textContent=`Профиль #${{p.id}}\\n${{p.profile_label}}\\nПодписка до: ${{p.subscription_until||'-'}}\\nКод привязки к Telegram: /claim ${{p.claim_code||localStorage.getItem(tokenKey)||''}}\\n\\n${{p.vpn_link}}`;return}}$('setupBtn').classList.add('hide');$('routingBtn').classList.add('hide');let paid=p.payment_status==='user_marked_paid'?'\\n\\nСтатус оплаты: отмечено как оплачено, ждём проверку администратора.':'\\n\\nПосле оплаты нажми кнопку ниже.';$('linkBox').innerHTML=`<pre>${{p.payment_text||''}}${{paid}}\\n\\nДля привязки Telegram: /claim ${{p.claim_code||localStorage.getItem(tokenKey)||''}}</pre>${{p.payment_link?`<div class="actions"><a class="btn" href="${{p.payment_link}}" target="_blank">Открыть оплату</a><button class="secondary" onclick="markPaid()">Я оплатил</button></div>`:`<div class="actions"><button class="secondary" onclick="markPaid()">Я оплатил</button></div>`}}${{p.payment_qr_url?`<img alt="QR оплаты" src="${{p.payment_qr_url}}" style="margin-top:14px;max-width:260px;width:100%;border-radius:8px;background:#fff;padding:8px">`:''}}`;}}
+function selectedPayment(){{let id=$('paymentMethod').value;return (CFG.paymentMethods||[]).find(p=>p.id===id)||CFG.defaultPayment||{{}}}}
+function renderPayment(p){{let pay=p?{{label:p.payment_method_label||selectedPayment().label,link:p.payment_link,qr_url:p.payment_qr_url}}:selectedPayment();let plan=$('plan').options[$('plan').selectedIndex]?.text||'';let profile=$('profile').options[$('profile').selectedIndex]?.text||'';$('paymentBox').innerHTML=`<b>Оплата</b><br>Тариф: ${{plan}}<br>Оператор: ${{profile}}<br>Банк: ${{pay.label||'оплата'}}<br>${{pay.link?`<div class="actions"><a class="btn" href="${{pay.link}}" target="_blank">Открыть оплату</a></div>`:''}}${{pay.qr_url?`<img alt="QR оплаты" src="${{pay.qr_url}}" style="margin-top:14px;max-width:260px;width:100%;border-radius:8px;background:#fff;padding:8px">`:'QR появится после настройки PAYMENT_LINK или PAYMENT_QR_URL'}}`;}}
+function renderProxy(){{if(!CFG.telegramProxyUrl)return;$('proxyBox').classList.remove('hide');$('proxyBox').innerHTML=`<b>Telegram не открывается?</b><br>Используй запасной бесплатный вход в Telegram, потом вернись сюда и оформи VPN.<div class="actions"><a class="btn secondary" href="${{CFG.telegramProxyUrl}}" target="_blank">Открыть прокси Telegram</a></div>`}}
+function showProfile(p){{localStorage.setItem(tokenKey,p.web_token||localStorage.getItem(tokenKey)||'');renderPayment(p);$('setupBtn').href=p.happ_setup_url||'#';$('routingBtn').href=p.routing_url||'#';$('linkBox').classList.remove('hide');if(p.status==='approved'&&p.vpn_link){{$('setupBtn').classList.remove('hide');$('routingBtn').classList.remove('hide');$('reissueBtn').classList.remove('hide');$('linkBox').textContent=`Профиль #${{p.id}}\\n${{p.profile_label}}\\nПодписка до: ${{p.subscription_until||'-'}}\\nКод привязки к Telegram: /claim ${{p.claim_code||localStorage.getItem(tokenKey)||''}}\\n\\n${{p.vpn_link}}`;return}}$('setupBtn').classList.add('hide');$('routingBtn').classList.add('hide');$('reissueBtn').classList.add('hide');let paid=p.payment_status==='user_marked_paid'?'\\n\\nСтатус оплаты: отмечено как оплачено, ждём проверку администратора.':'\\n\\nПосле оплаты нажми кнопку ниже.';if(p.status==='approved'){{$('linkBox').textContent='Старая VPN-ссылка больше не активна. Если подписка закончилась или профиль отключён, обратись к администратору.';return}}$('linkBox').innerHTML=`<pre>${{p.payment_text||''}}${{paid}}\\n\\nДля привязки Telegram: /claim ${{p.claim_code||localStorage.getItem(tokenKey)||''}}</pre><div class="actions"><button class="secondary" onclick="markPaid()">Я оплатил</button></div>`;}}
 async function issue(){{if($('noUsername').checked){{$('issueResult').classList.remove('hide');$('issueResult').textContent='Сначала создайте username в Telegram: Мой профиль -> Имя пользователя. Потом вернитесь и введите @username.';return}}$('issueBtn').disabled=true;$('issueResult').classList.remove('hide');$('issueResult').textContent='Создаю заявку...';try{{let d=await api('/api/public/issue',{{method:'POST',body:JSON.stringify({{name:$('name').value,contact:$('contact').value,plan_id:$('plan').value,profile_type:$('profile').value,payment_method:$('paymentMethod').value,access_token:$('accessToken').value,web_token:localStorage.getItem(tokenKey)||''}})}});localStorage.setItem(tokenKey,d.web_token);$('issueResult').textContent=d.created?'Заявка создана. Оплати и дождись проверки.':'У тебя уже есть активная или ожидающая заявка.';showProfile(d.profile)}}catch(e){{$('issueResult').textContent=e.message}}finally{{$('issueBtn').disabled=false}}}}
 async function markPaid(){{let t=localStorage.getItem(tokenKey)||'';if(!t)return;try{{let d=await api('/api/public/paid',{{method:'POST',body:JSON.stringify({{web_token:t}})}});showProfile(d.profile)}}catch(e){{$('linkBox').textContent=e.message}}}}
-async function loadMine(){{let t=localStorage.getItem(tokenKey)||'';if(!t){{$('linkBox').classList.remove('hide');$('linkBox').textContent='В этом браузере еще нет выпущенной ссылки.';return}}try{{let d=await api('/api/public/me?token='+encodeURIComponent(t));showProfile(d.profile)}}catch(e){{$('linkBox').classList.remove('hide');$('linkBox').textContent=e.message}}}}
-async function loadStatus(){{try{{let d=await api('/api/public/server');$('serverStatus').textContent=d.summary}}catch(e){{$('serverStatus').textContent='Сервер недоступен'}}}}
-fill();loadMine();loadStatus();
+async function reissue(){{let t=localStorage.getItem(tokenKey)||'';if(!t)return;try{{let d=await api('/api/public/reissue',{{method:'POST',body:JSON.stringify({{web_token:t}})}});showProfile(d.profile)}}catch(e){{$('linkBox').textContent=e.message}}}}
+async function loadMine(){{renderPayment();renderProxy();let t=localStorage.getItem(tokenKey)||'';if(!t){{$('linkBox').classList.remove('hide');$('linkBox').textContent='В этом браузере еще нет выпущенной ссылки.';return}}try{{let d=await api('/api/public/me?token='+encodeURIComponent(t));showProfile(d.profile)}}catch(e){{localStorage.removeItem(tokenKey);$('linkBox').classList.remove('hide');$('linkBox').textContent='Старая ссылка убрана с сайта: профиль не найден или больше не активен.'}}}}
+async function loadStatus(){{try{{let d=await api('/api/public/server');$('serverStatus').textContent=d.summary;if(String(d.summary).toLowerCase().includes('не')){{$('serverAlert').classList.remove('hide');$('serverAlert').textContent='Внимание: сервер может быть недоступен. Если VPN не подключается, дождись восстановления или напиши администратору.'}}}}catch(e){{$('serverStatus').textContent='Сервер недоступен';$('serverAlert').classList.remove('hide');$('serverAlert').textContent='Внимание: сервер недоступен. Заявку можно оставить, но подключение может заработать после восстановления.'}}}}
+fill();$('paymentMethod').addEventListener('change',()=>renderPayment());$('plan').addEventListener('change',()=>renderPayment());$('profile').addEventListener('change',()=>renderPayment());loadMine();loadStatus();
 </script>
 </body>
 </html>"""
@@ -2289,6 +2316,40 @@ def start_routing_web_server(config: Config, store: Store | None = None, manager
                 self._send_json(500, {"ok": False, "error": str(exc)})
 
         def _handle_public_post(self, path: str) -> None:
+            if path == "/api/public/reissue":
+                if not store or not manager:
+                    self._send_json(503, {"ok": False, "error": "Сайт еще запускается."})
+                    return
+                payload = self._read_json()
+                row = store.get_request_by_web_token(str(payload.get("web_token") or "").strip())
+                if not row:
+                    self._send_json(404, {"ok": False, "error": "Профиль не найден в этом браузере."})
+                    return
+                if not is_subscription_active(row) or not row.get("client_email"):
+                    self._send_json(403, {"ok": False, "error": "Перевыпуск доступен только для активной VPN-ссылки."})
+                    return
+                profile_type = str(row.get("profile_type") or "default")
+                if not is_profile_type(profile_type):
+                    profile_type = "default"
+                old_client_email = str(row.get("client_email") or "")
+                client_uuid = str(uuid.uuid4())
+                client_email = approval_client_email(row, int(row["id"]))
+                if old_client_email:
+                    try:
+                        manager.remove_client(old_client_email)
+                    except Exception:
+                        logging.exception("Could not remove old web client before reissue")
+                save_client_and_verify(manager, config, client_email, client_uuid, profile_type)
+                store.update_profile(int(row["id"]), profile_type, client_email, client_uuid)
+                updated = store.get_request(int(row["id"])) or row
+                if bot:
+                    try:
+                        link = build_vless_link(config, client_uuid, profile_type, f"VPN {row['id']} {profile_short(profile_type)}")
+                        send_row_message(bot, updated, "VPN-ссылка перевыпущена. Старая ссылка отключена.", happ_setup_markup(config, link))
+                    except Exception:
+                        logging.exception("Could not notify web user about reissue")
+                self._send_json(200, {"ok": True, "profile": public_profile_payload(updated, config)})
+                return
             if path == "/api/public/paid":
                 if not store:
                     self._send_json(503, {"ok": False, "error": "Сайт еще запускается."})
