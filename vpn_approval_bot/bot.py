@@ -81,6 +81,7 @@ class Config:
     web_port: int
     admin_web_token: str
     public_telegram_proxy_url: str
+    public_telegram_channel_url: str
     reserve_vpn_host: str
     public_issue_enabled: bool
     public_issue_token: str
@@ -893,6 +894,7 @@ def load_config() -> Config:
         web_port=int(_get(raw, "PORT", "0") or "0"),
         admin_web_token=_get(raw, "ADMIN_WEB_TOKEN"),
         public_telegram_proxy_url=_get(raw, "PUBLIC_TELEGRAM_PROXY_URL"),
+        public_telegram_channel_url=_get(raw, "PUBLIC_TELEGRAM_CHANNEL_URL"),
         reserve_vpn_host=_get(raw, "RESERVE_VPN_HOST"),
         public_issue_enabled=_get_bool(raw, "PUBLIC_ISSUE_ENABLED"),
         public_issue_token=_get(raw, "PUBLIC_ISSUE_TOKEN"),
@@ -2115,6 +2117,7 @@ def build_public_vpn_html(config: Config) -> str:
             ],
             "defaultPayment": payment_payload(config),
             "telegramProxyUrl": config.public_telegram_proxy_url,
+            "telegramChannelUrl": config.public_telegram_channel_url,
         },
         ensure_ascii=False,
     )
@@ -2149,6 +2152,7 @@ def build_public_vpn_html(config: Config) -> str:
 <h2>Оплата и статус</h2>
 <p class="muted">QR, ссылка оплаты, статус сервера и твоя VPN-ссылка находятся здесь.</p>
 <div id="paymentBox" class="result"></div>
+<div id="channelBox" class="result hide"></div>
 <div id="proxyBox" class="result hide"></div>
 <div id="serverAlert" class="result hide"></div>
 <div class="actions"><a id="setupBtn" class="btn hide" href="#">Открыть Happ</a><a id="routingBtn" class="btn secondary hide" href="#">Маршрутизация</a><button id="reissueBtn" class="secondary hide" onclick="reissue()">Перевыпустить ссылку</button></div>
@@ -2164,14 +2168,15 @@ function fill(){{CFG.plans.forEach(p=>$('plan').add(new Option(p.label,p.id)));C
 async function api(path,opts={{}}){{let r=await fetch(path,Object.assign({{headers:{{'Content-Type':'application/json'}}}},opts));let d=await r.json();if(!r.ok||!d.ok)throw new Error(d.error||'Ошибка');return d}}
 function selectedPayment(){{let id=$('paymentMethod').value;return (CFG.paymentMethods||[]).find(p=>p.id===id)||CFG.defaultPayment||{{}}}}
 function renderPayment(p){{let pay=p?{{label:p.payment_method_label||selectedPayment().label,link:p.payment_link,qr_url:p.payment_qr_url}}:selectedPayment();let plan=$('plan').options[$('plan').selectedIndex]?.text||'';let profile=$('profile').options[$('profile').selectedIndex]?.text||'';$('paymentBox').innerHTML=`<b>Оплата</b><br>Тариф: ${{plan}}<br>Оператор: ${{profile}}<br>Банк: ${{pay.label||'оплата'}}<br>${{pay.link?`<div class="actions"><a class="btn" href="${{pay.link}}" target="_blank">Открыть оплату</a></div>`:''}}${{pay.qr_url?`<img alt="QR оплаты" src="${{pay.qr_url}}" style="margin-top:14px;max-width:260px;width:100%;border-radius:8px;background:#fff;padding:8px">`:'QR появится после настройки PAYMENT_LINK или PAYMENT_QR_URL'}}`;}}
+function renderChannel(){{if(!CFG.telegramChannelUrl)return;$('channelBox').classList.remove('hide');$('channelBox').innerHTML=`<b>Новости и поддержка</b><br>В канале будут статусы, инструкции и объявления.<div class="actions"><a class="btn secondary" href="${{CFG.telegramChannelUrl}}" target="_blank">Открыть Telegram-канал</a></div>`}}
 function renderProxy(){{if(!CFG.telegramProxyUrl)return;$('proxyBox').classList.remove('hide');$('proxyBox').innerHTML=`<b>Telegram не открывается?</b><br>Используй запасной бесплатный вход в Telegram, потом вернись сюда и оформи VPN.<div class="actions"><a class="btn secondary" href="${{CFG.telegramProxyUrl}}" target="_blank">Открыть прокси Telegram</a></div>`}}
 function showProfile(p){{localStorage.setItem(tokenKey,p.web_token||localStorage.getItem(tokenKey)||'');renderPayment(p);$('setupBtn').href=p.happ_setup_url||'#';$('routingBtn').href=p.routing_url||'#';$('linkBox').classList.remove('hide');if(p.status==='approved'&&p.vpn_link){{$('setupBtn').classList.remove('hide');$('routingBtn').classList.remove('hide');$('reissueBtn').classList.remove('hide');$('linkBox').innerHTML=`<pre>Профиль #${{p.id}}\\n${{p.profile_label}}\\nПодписка до: ${{p.subscription_until||'-'}}\\n\\n${{p.vpn_link}}</pre>`;return}}$('setupBtn').classList.add('hide');$('routingBtn').classList.add('hide');$('reissueBtn').classList.add('hide');let paid=p.payment_status==='user_marked_paid'?'\\n\\nСтатус оплаты: отмечено как оплачено, ждём проверку администратора.':'\\n\\nПосле оплаты нажми кнопку ниже.';if(p.status==='approved'){{$('linkBox').textContent='Старая VPN-ссылка больше не активна. Если подписка закончилась или профиль отключён, обратись к администратору.';return}}$('linkBox').innerHTML=`<pre>${{p.payment_text||''}}${{paid}}</pre><div class="actions"><button class="secondary" onclick="markPaid()">Я оплатил</button></div>`;}}
 async function issue(){{$('issueBtn').disabled=true;$('issueResult').classList.remove('hide');$('issueResult').textContent='Создаю заявку...';try{{let d=await api('/api/public/issue',{{method:'POST',body:JSON.stringify({{name:$('name').value,contact:$('contact').value,plan_id:$('plan').value,profile_type:$('profile').value,payment_method:$('paymentMethod').value,access_token:$('accessToken').value,web_token:localStorage.getItem(tokenKey)||''}})}});localStorage.setItem(tokenKey,d.web_token);$('issueResult').textContent=d.created?'Заявка создана. Оплати и дождись проверки.':'У тебя уже есть активная или ожидающая заявка.';showProfile(d.profile)}}catch(e){{$('issueResult').textContent=e.message}}finally{{$('issueBtn').disabled=false}}}}
 async function markPaid(){{let t=localStorage.getItem(tokenKey)||'';if(!t)return;try{{let d=await api('/api/public/paid',{{method:'POST',body:JSON.stringify({{web_token:t}})}});showProfile(d.profile)}}catch(e){{$('linkBox').textContent=e.message}}}}
 async function reissue(){{let t=localStorage.getItem(tokenKey)||'';if(!t)return;try{{let d=await api('/api/public/reissue',{{method:'POST',body:JSON.stringify({{web_token:t}})}});showProfile(d.profile)}}catch(e){{$('linkBox').textContent=e.message}}}}
-async function loadMine(){{renderPayment();renderProxy();let t=localStorage.getItem(tokenKey)||'';if(!t){{$('linkBox').classList.remove('hide');$('linkBox').textContent='В этом браузере еще нет выпущенной ссылки.';return}}try{{let d=await api('/api/public/me?token='+encodeURIComponent(t));showProfile(d.profile)}}catch(e){{localStorage.removeItem(tokenKey);$('linkBox').classList.remove('hide');$('linkBox').textContent='Старая ссылка убрана с сайта: профиль не найден или больше не активен.'}}}}
+async function loadMine(){{renderPayment();renderChannel();renderProxy();let t=localStorage.getItem(tokenKey)||'';if(!t){{$('linkBox').classList.remove('hide');$('linkBox').textContent='В этом браузере еще нет выпущенной ссылки.';return}}try{{let d=await api('/api/public/me?token='+encodeURIComponent(t));showProfile(d.profile)}}catch(e){{localStorage.removeItem(tokenKey);$('linkBox').classList.remove('hide');$('linkBox').textContent='Старая ссылка убрана с сайта: профиль не найден или больше не активен.'}}}}
 async function loadStatus(){{try{{let d=await api('/api/public/server');$('serverStatus').textContent=d.summary;if(String(d.summary).toLowerCase().includes('не')){{$('serverAlert').classList.remove('hide');$('serverAlert').textContent='Внимание: сервер может быть недоступен. Если VPN не подключается, дождись восстановления или напиши администратору.'}}}}catch(e){{$('serverStatus').textContent='Сервер недоступен';$('serverAlert').classList.remove('hide');$('serverAlert').textContent='Внимание: сервер недоступен. Заявку можно оставить, но подключение может заработать после восстановления.'}}}}
-fill();$('paymentMethod').addEventListener('change',()=>renderPayment());$('plan').addEventListener('change',()=>renderPayment());$('profile').addEventListener('change',()=>renderPayment());loadMine();loadStatus();
+fill();$('paymentMethod').addEventListener('change',()=>renderPayment());$('plan').addEventListener('change',()=>renderPayment());$('profile').addEventListener('change',()=>renderPayment());window.addEventListener('focus',loadMine);loadMine();loadStatus();setInterval(loadMine,15000);
 </script>
 </body>
 </html>"""
