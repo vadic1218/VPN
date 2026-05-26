@@ -486,30 +486,16 @@ def normalize_public_contact(value: str) -> str:
     return normalized
 
 
-def normalize_phone(value: str) -> str:
-    digits = re.sub(r"\D+", "", value)
-    if len(digits) == 11 and digits.startswith("8"):
-        digits = "7" + digits[1:]
-    elif len(digits) == 10 and digits.startswith("9"):
-        digits = "7" + digits
-    elif len(digits) == 11 and digits.startswith("7"):
-        pass
-    else:
-        return ""
-    return f"+{digits}"
+def normalize_telegram_username(value: str) -> str:
+    username = normalize_public_contact(value)
+    if re.fullmatch(r"[a-z0-9_]{5,32}", username):
+        return username
+    return ""
 
 
 def contact_keys(value: str) -> set[str]:
-    raw = value.strip()
-    compact = normalize_public_contact(raw)
-    keys = {compact} if compact else set()
-    phone = normalize_phone(raw)
-    if phone:
-        keys.add(phone)
-        keys.add(phone[1:])
-    if "@" in compact and "." in compact:
-        keys.add(compact)
-    return {key for key in keys if key}
+    username = normalize_telegram_username(value)
+    return {username} if username else set()
 
 
 def chat_id_from_contact(value: str) -> int:
@@ -517,10 +503,6 @@ def chat_id_from_contact(value: str) -> int:
     explicit = re.fullmatch(r"id[:\s-]*(\d{6,})", raw, flags=re.IGNORECASE)
     if explicit:
         return int(explicit.group(1))
-    if normalize_phone(raw):
-        return 0
-    if re.fullmatch(r"\d{6,}", raw):
-        return int(raw)
     return 0
 
 
@@ -2107,8 +2089,8 @@ def build_public_vpn_html(config: Config) -> str:
 <h2>Оформить доступ</h2>
 <p class="muted">Сайт создаст заявку и реквизиты оплаты. VPN-ссылка появится здесь только после проверки оплаты администратором. На один контакт можно иметь только одну активную или ожидающую заявку.</p>
 <label>Имя</label><input id="name" placeholder="Как тебя записать">
-<label>Контакт</label><input id="contact" placeholder="@username, +79050122709, 89050122709 или mail@example.com">
-<p class="muted">Лучше писать слитно: @username, +79050122709, 89050122709, user@mail.ru. Также подойдут +7 905 012-27-09 и 8 (905) 012-27-09 - сайт сам приведёт телефон к виду +79050122709. Если знаешь Telegram chat id, пиши так: id:123456789.</p>
+<label>Telegram username</label><input id="contact" placeholder="@username">
+<p class="muted">Где найти: открой Telegram -> Настройки -> Имя пользователя. Скопируй имя в формате @username. Если username не задан, сначала создай его в настройках Telegram. Телефон и почта не подходят: бот не может найти по ним человека.</p>
 <label>Тариф</label><select id="plan"></select>
 <label>Оператор</label><select id="profile"></select>
 <label>Оплата</label><select id="paymentMethod"></select>
@@ -2304,7 +2286,10 @@ def start_routing_web_server(config: Config, store: Store | None = None, manager
                             bot.send_message(admin_chat_id, text, admin_request_markup(int(row["id"])))
                         except Exception:
                             logging.exception("Could not notify admin about web payment")
-                    send_row_message(bot, row, f"Оплата по заявке #{row['id']} отмечена. Админ проверит платеж и включит VPN.")
+                    try:
+                        send_row_message(bot, row, f"Оплата по заявке #{row['id']} отмечена. Админ проверит платеж и включит VPN.")
+                    except Exception:
+                        logging.exception("Could not notify web user about payment")
                 self._send_json(200, {"ok": True, "profile": public_profile_payload(row, config)})
                 return
             if path != "/api/public/issue":
@@ -2332,8 +2317,8 @@ def start_routing_web_server(config: Config, store: Store | None = None, manager
                     payment_method = next(iter(payment_methods(config)), "sber")
                 display_name = str(payload.get("name") or "").strip()[:80]
                 contact = str(payload.get("contact") or "").strip()[:80]
-                if not contact:
-                    self._send_json(400, {"ok": False, "error": "Укажи контакт: Telegram username, телефон или почту."})
+                if not normalize_telegram_username(contact):
+                    self._send_json(400, {"ok": False, "error": "Укажи Telegram username в формате @username. Телефон и почта не подходят: бот не может найти по ним человека."})
                     return
                 web_token = str(payload.get("web_token") or "").strip()
                 if not re.fullmatch(r"[a-f0-9]{32}", web_token):
@@ -2362,11 +2347,14 @@ def start_routing_web_server(config: Config, store: Store | None = None, manager
                             bot.send_message(admin_chat_id, text, admin_request_markup(int(row["id"])))
                         except Exception:
                             logging.exception("Could not notify admin about public web request")
-                    send_row_message(
-                        bot,
-                        row,
-                        f"Заявка #{row['id']} создана. Оплати {plan_info(plan_id)['price']} руб, комментарий: {payment_comment(int(row['id']))}. После оплаты нажми «Я оплатил» на сайте.",
-                    )
+                    try:
+                        send_row_message(
+                            bot,
+                            row,
+                            f"Заявка #{row['id']} создана. Оплати {plan_info(plan_id)['price']} руб, комментарий: {payment_comment(int(row['id']))}. После оплаты нажми «Я оплатил» на сайте.",
+                        )
+                    except Exception:
+                        logging.exception("Could not notify web user about request")
                 self._send_json(200, {"ok": True, "created": created, "web_token": web_token, "profile": public_profile_payload(row, config)})
             except Exception as exc:
                 logging.exception("Public web issue failed")

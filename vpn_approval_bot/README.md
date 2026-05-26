@@ -183,7 +183,7 @@ VPN_MTS_PORT=8443
 VPN_ALT_PORT=2053
 VPN_DEFAULT_SUBSCRIPTION_DAYS=30
 RESERVE_VPN_HOST=
-PAYMENT_LINK=https://www.sberbank.com/sms/pbpn?requisiteNumber=79050122709
+PAYMENT_LINK=https://www.sberbank.com/sms/pbpn?requisiteNumber=79001234567
 PAYMENT_TBANK_LINK=https://www.tinkoff.ru/rm/r_fpDGcUCZRx.uCrfsYPegf/WuswZ21804
 PAYMENT_QR_URL=
 PAYMENT_RECIPIENT=Вадим
