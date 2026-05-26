@@ -1291,6 +1291,32 @@ class Store:
                 return request
         return None
 
+    def get_active_request_by_user(self, chat_id: int, username: str, full_name: str = "") -> dict[str, Any] | None:
+        existing = self.get_active_request_by_chat_id(chat_id)
+        if existing:
+            return existing
+        normalized_keys = contact_keys(username)
+        if not normalized_keys:
+            return None
+        data = self._read()
+        for request in reversed(data["requests"]):
+            if request.get("status") not in {"pending", "approved"}:
+                continue
+            if not (normalized_keys & self._request_contact_keys(request)):
+                continue
+            request["chat_id"] = chat_id
+            request["source"] = "web_claimed"
+            if username:
+                request["username"] = username
+                request["contact_key"] = normalize_public_contact(username)
+                request["contact_keys"] = sorted(normalized_keys)
+            if full_name:
+                request["full_name"] = full_name
+            request["claimed_at"] = utc_now_iso()
+            self._write(data)
+            return request
+        return None
+
     def list_approved_requests(self) -> list[dict[str, Any]]:
         data = self._read()
         latest_by_owner: dict[str, dict[str, Any]] = {}
@@ -3606,6 +3632,20 @@ def user_display(user: dict[str, Any]) -> tuple[str, str]:
     return username, full_name
 
 
+def active_request_for_message(store: Store, message: dict[str, Any]) -> dict[str, Any] | None:
+    chat = message.get("chat") or {}
+    user = message.get("from") or {}
+    chat_id = int(chat.get("id") or 0)
+    username, full_name = user_display(user)
+    return store.get_active_request_by_user(chat_id, username, full_name)
+
+
+def active_request_for_user(store: Store, user: dict[str, Any]) -> dict[str, Any] | None:
+    chat_id = int(user.get("id") or 0)
+    username, full_name = user_display(user)
+    return store.get_active_request_by_user(chat_id, username, full_name)
+
+
 def format_username(username: str) -> str:
     username = username.strip().lstrip("@")
     if not username or username == "-":
@@ -4115,7 +4155,7 @@ def handle_message(
         return
 
     if text.startswith("/reissue") or text.lower() == "перевыпустить ссылку":
-        existing = store.get_active_request_by_chat_id(chat_id)
+        existing = active_request_for_message(store, message)
         if not existing or existing.get("status") != "approved":
             bot.send_message(chat_id, "У тебя ещё нет активного VPN-профиля. Сначала напиши /vpn.")
             return
@@ -4127,7 +4167,7 @@ def handle_message(
         return
 
     if text.startswith("/change_plan") or text.lower() == "сменить тариф":
-        existing = store.get_active_request_by_chat_id(chat_id)
+        existing = active_request_for_message(store, message)
         if not existing or existing.get("status") != "approved":
             bot.send_message(chat_id, "У тебя пока нет активного VPN-профиля. Сначала оформи VPN через /vpn.")
             return
@@ -4140,7 +4180,7 @@ def handle_message(
         return
 
     if text.startswith("/subscription") or text.lower() == "моя подписка":
-        existing = store.get_active_request_by_chat_id(chat_id)
+        existing = active_request_for_message(store, message)
         if not existing or existing.get("status") != "approved":
             bot.send_message(
                 chat_id,
@@ -4161,7 +4201,7 @@ def handle_message(
         return
 
     if text.startswith("/price") or text.lower() == "прайс лист":
-        existing = store.get_active_request_by_chat_id(chat_id)
+        existing = active_request_for_message(store, message)
         if existing and existing.get("status") == "approved":
             bot.send_message(
                 chat_id,
@@ -4178,7 +4218,7 @@ def handle_message(
         return
 
     if text.lower() == "статус заявки":
-        existing = store.get_active_request_by_chat_id(chat_id)
+        existing = active_request_for_message(store, message)
         if not existing:
             bot.send_message(chat_id, "Заявок пока нет. Нажми «Получить VPN».", user_reply_markup())
             return
@@ -4209,7 +4249,7 @@ def handle_message(
         return
 
     if text.startswith("/vpn") or text.lower() == "получить vpn":
-        existing = store.get_active_request_by_chat_id(chat_id)
+        existing = active_request_for_message(store, message)
         if existing:
             if existing.get("status") == "pending":
                 bot.send_message(
@@ -4294,7 +4334,7 @@ def handle_callback(
         return
 
     if parts[0] == "show_devices":
-        existing = store.get_active_request_by_chat_id(user_chat_id)
+        existing = active_request_for_user(store, from_user)
         if not existing or existing.get("status") != "approved":
             bot.answer_callback_query(callback_id, "Активный профиль не найден.")
             return
@@ -4303,7 +4343,7 @@ def handle_callback(
         return
 
     if parts[0] == "show_subscription":
-        existing = store.get_active_request_by_chat_id(user_chat_id)
+        existing = active_request_for_user(store, from_user)
         if not existing or existing.get("status") != "approved":
             bot.answer_callback_query(callback_id, "Активный профиль не найден.")
             return
@@ -4319,7 +4359,7 @@ def handle_callback(
         return
 
     if parts[0] == "add_device":
-        existing = store.get_active_request_by_chat_id(user_chat_id)
+        existing = active_request_for_user(store, from_user)
         if not existing or existing.get("status") != "approved":
             bot.answer_callback_query(callback_id, "Активный профиль не найден.")
             return
@@ -4403,7 +4443,7 @@ def handle_callback(
         return
 
     if parts[0] == "show_change_plan":
-        existing = store.get_active_request_by_chat_id(user_chat_id)
+        existing = active_request_for_user(store, from_user)
         if not existing or existing.get("status") != "approved":
             bot.answer_callback_query(callback_id, "Активный профиль не найден.")
             return
@@ -4443,7 +4483,7 @@ def handle_callback(
             bot.answer_callback_query(callback_id, "Неизвестный тип профиля.")
             return
 
-        existing = store.get_active_request_by_chat_id(user_chat_id)
+        existing = active_request_for_user(store, from_user)
         if existing:
             if existing.get("status") == "pending":
                 bot.answer_callback_query(callback_id, "Заявка уже ожидает решения.")
@@ -4516,7 +4556,7 @@ def handle_callback(
         if plan_id not in SUBSCRIPTION_PLANS:
             bot.answer_callback_query(callback_id, "Неизвестный тариф.")
             return
-        existing = store.get_active_request_by_chat_id(user_chat_id)
+        existing = active_request_for_user(store, from_user)
         if not existing or existing.get("status") != "approved":
             bot.answer_callback_query(callback_id, "Активный профиль не найден.")
             return
