@@ -85,6 +85,14 @@ https://your-railway-domain.up.railway.app/admin
 
 The web panel supports the same core admin actions as Telegram: paid clients, free clients, pending requests, client cards, device summaries, subscription extension, tariff changes, plan-change approval/rejection, operator reissue, free access toggle, full disable, per-client activity stats, and server resource status. The panel uses the same `DB_PATH`, remote backup, Xray SSH settings, and Telegram bot token as the bot.
 
+Public self-service is available at:
+
+```text
+https://your-railway-domain.up.railway.app/vpn
+```
+
+Enable it with `PUBLIC_ISSUE_ENABLED=1`. If `PUBLIC_ISSUE_TOKEN` is set, visitors must enter that code before the site generates a VPN link. Web-issued profiles are written to the same `DB_PATH`, notify admins in Telegram, appear in the admin web panel, and include a `/claim TOKEN` command so the user can later attach the website profile to their Telegram account.
+
 Xray config writes are serialized with a remote lock before the bot adds, reissues, or disables a profile. This prevents overlapping approvals from corrupting the config or stacking multiple Xray restarts. The current server does not expose the Xray API, so profile add/remove operations can still cause a short reconnect while Xray restarts; fully zero-drop provisioning requires enabling the Xray API in a separate migration.
 
 The bot also watches recent Xray logs for soft sharing detection. If one approved profile appears from two or more different IPs within the recent activity window, admins receive a warning with `Отключить`, `Перевыпустить`, and `Игнорировать` actions. The bot does not auto-block users from this check.
@@ -156,6 +164,8 @@ PAYMENT_RECIPIENT
 PAYMENT_BANKS
 PUBLIC_BASE_URL
 ADMIN_WEB_TOKEN
+PUBLIC_ISSUE_ENABLED
+PUBLIC_ISSUE_TOKEN
 ```
 
 Recommended Railway values:
@@ -180,6 +190,8 @@ PAYMENT_RECIPIENT=Вадим
 PAYMENT_BANKS=Сбер / Т-Банк
 PUBLIC_BASE_URL=https://your-railway-domain.up.railway.app
 ADMIN_WEB_TOKEN=put-a-long-random-password-here
+PUBLIC_ISSUE_ENABLED=1
+PUBLIC_ISSUE_TOKEN=optional-public-code
 ```
 
 If you use `DB_PATH=/data/vpn_approval.json`, attach a Railway volume mounted at `/data` so requests and clients survive restarts.
