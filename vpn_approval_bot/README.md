@@ -190,7 +190,7 @@ PAYMENT_RECIPIENT=Вадим
 PAYMENT_BANKS=Сбер / Т-Банк
 PUBLIC_BASE_URL=https://your-railway-domain.up.railway.app
 PUBLIC_TELEGRAM_PROXY_URL=https://t.me/proxy?server=example.com&port=443&secret=PASTE_SECRET
-PUBLIC_TELEGRAM_CHANNEL_URL=https://t.me/your_channel
+PUBLIC_TELEGRAM_BOT_URL=https://t.me/your_bot
 ADMIN_WEB_TOKEN=put-a-long-random-password-here
 PUBLIC_ISSUE_ENABLED=1
 PUBLIC_ISSUE_TOKEN=optional-public-code
