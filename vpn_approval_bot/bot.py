@@ -31,6 +31,7 @@ POLL_TIMEOUT = 30
 PUBLIC_PORT_TIMEOUT_SECONDS = 5
 SHARING_CHECK_INTERVAL_SECONDS = 60
 SUBSCRIPTION_CHECK_INTERVAL_SECONDS = 600
+SERVER_HEALTH_CHECK_INTERVAL_SECONDS = 900
 INACTIVE_CHECK_INTERVAL_SECONDS = 86400
 SHARING_LOOKBACK_MINUTES = 10
 SHARING_IP_GRACE = 1
@@ -3132,6 +3133,11 @@ systemctl is-active xray-profile-guard
             for key, command in commands.items():
                 _, out, err = self._run(client, command)
                 result[key] = (out or err).strip()
+            try:
+                verify_public_vpn_endpoint(self, self.config, "default")
+                result["endpoint"] = "ok"
+            except Exception as exc:
+                result["endpoint"] = f"Публичный VPN endpoint не отвечает: {exc}"
             return result
         finally:
             client.close()
@@ -3798,6 +3804,20 @@ def ports_ru(value: Any) -> str:
     if not ports:
         return "- открытых VPN-портов не найдено"
     return "\n".join(f"- порт {port}: открыт" for port in sorted(ports, key=int))
+
+
+def server_health_problem(status: dict[str, Any], config: Config) -> str:
+    xray = str(status.get("xray") or "").strip().lower()
+    if xray != "active":
+        return f"Xray не active: {xray or '-'}"
+    ports = str(status.get("ports") or "")
+    expected_ports = {str(profile_port(config, key)) for key in OPERATOR_PROFILES}
+    if not any(f":{port}" in ports for port in expected_ports):
+        return "Xray active, но VPN-порты не слушаются"
+    endpoint = str(status.get("endpoint") or "").strip()
+    if endpoint and endpoint != "ok":
+        return endpoint
+    return ""
 
 
 def format_vpn_status(status: dict[str, Any], config: Config) -> str:
@@ -5087,6 +5107,47 @@ def check_inactive_clients(bot: TelegramBot, store: Store, config: Config, manag
         store._write(data)
 
 
+def check_server_health(bot: TelegramBot, store: Store, config: Config, manager: XrayManager) -> None:
+    try:
+        status = manager.check_server_status()
+        problem = server_health_problem(status, config)
+    except Exception as exc:
+        logging.exception("Server health check failed")
+        status = {}
+        problem = f"Не удалось проверить сервер: {exc}"
+
+    data = store._read()
+    monitor = data.setdefault("server_monitor", {})
+    was_down = bool(monitor.get("down"))
+    previous_problem = str(monitor.get("problem") or "")
+    if problem:
+        monitor["down"] = True
+        monitor["problem"] = problem
+        monitor["checked_at"] = utc_now_iso()
+        store._write(data)
+        if was_down and previous_problem == problem:
+            return
+        proxy = config.public_telegram_proxy_url or "PUBLIC_TELEGRAM_PROXY_URL не настроен"
+        text = (
+            "⚠️ VPN-сервер может не работать\n\n"
+            f"Проблема: {problem}\n"
+            f"Xray: {service_status_ru(status.get('xray'))}\n"
+            f"Порты:\n{ports_ru(status.get('ports'))}\n\n"
+            f"Запасной Telegram proxy для клиентов:\n{proxy}"
+        )
+        for admin_chat_id in config.admin_chat_ids:
+            bot.send_message(admin_chat_id, text)
+        return
+
+    monitor["down"] = False
+    monitor["problem"] = ""
+    monitor["checked_at"] = utc_now_iso()
+    store._write(data)
+    if was_down:
+        for admin_chat_id in config.admin_chat_ids:
+            bot.send_message(admin_chat_id, "✅ VPN-сервер снова отвечает. Xray active, порты и endpoint проверены.")
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     config = load_config()
@@ -5128,6 +5189,7 @@ def main() -> None:
     last_sharing_check = 0.0
     last_subscription_check = 0.0
     last_inactive_check = 0.0
+    last_server_health_check = 0.0
     while True:
         try:
             now = time.monotonic()
@@ -5151,6 +5213,13 @@ def main() -> None:
                 except Exception:
                     logging.exception("Sharing alert check failed")
                 last_sharing_check = now
+
+            if now - last_server_health_check >= SERVER_HEALTH_CHECK_INTERVAL_SECONDS:
+                try:
+                    check_server_health(bot, store, config, manager)
+                except Exception:
+                    logging.exception("Server health check failed")
+                last_server_health_check = now
 
             updates = bot.get_updates(offset=offset)
             for update in updates:
