@@ -31,7 +31,6 @@ POLL_TIMEOUT = 30
 PUBLIC_PORT_TIMEOUT_SECONDS = 5
 SHARING_CHECK_INTERVAL_SECONDS = 60
 SUBSCRIPTION_CHECK_INTERVAL_SECONDS = 600
-SERVER_HEALTH_CHECK_INTERVAL_SECONDS = 900
 INACTIVE_CHECK_INTERVAL_SECONDS = 86400
 SHARING_LOOKBACK_MINUTES = 10
 SHARING_IP_GRACE = 1
@@ -81,7 +80,6 @@ class Config:
     public_base_url: str
     web_port: int
     admin_web_token: str
-    public_telegram_proxy_url: str
     public_telegram_bot_url: str
     reserve_vpn_host: str
     public_issue_enabled: bool
@@ -894,7 +892,6 @@ def load_config() -> Config:
         public_base_url=_get(raw, "PUBLIC_BASE_URL", default_public_base_url).rstrip("/"),
         web_port=int(_get(raw, "PORT", "0") or "0"),
         admin_web_token=_get(raw, "ADMIN_WEB_TOKEN"),
-        public_telegram_proxy_url=_get(raw, "PUBLIC_TELEGRAM_PROXY_URL"),
         public_telegram_bot_url=_get(raw, "PUBLIC_TELEGRAM_BOT_URL"),
         reserve_vpn_host=_get(raw, "RESERVE_VPN_HOST"),
         public_issue_enabled=_get_bool(raw, "PUBLIC_ISSUE_ENABLED"),
@@ -1633,6 +1630,18 @@ class Store:
                 self._write(data)
                 return
 
+    def delete_request(self, request_id: int) -> dict[str, Any] | None:
+        data = self._read()
+        requests = data.get("requests") or []
+        for index, request in enumerate(requests):
+            if int(request.get("id") or 0) != request_id:
+                continue
+            removed = requests.pop(index)
+            data["requests"] = requests
+            self._write(data)
+            return removed
+        return None
+
     def set_free_access(self, request_id: int, is_free: bool) -> dict[str, Any] | None:
         data = self._read()
         for request in data["requests"]:
@@ -2041,7 +2050,7 @@ function ok(row){{let q=document.getElementById('search').value.trim().toLowerCa
 function renderCards(){{if(selected)return renderDetail(selected);let rows=clients.filter(ok),title={{paid:'Платные клиенты',free:'Бесплатные клиенты',pending:'Заявки',all:'Все профили'}}[kind]||'Клиенты';document.getElementById('view').innerHTML=`<h2>${{title}} · ${{rows.length}}</h2><div class="cards">${{rows.map(card).join('')||'<div class="box">Пока пусто.</div>'}}</div>`}}
 function card(r){{let p=r.raw_status==='pending';return `<article class="card"><h3>#${{r.id}} · ${{r.username}}</h3><div class="meta">${{r.full_name}}<br>Источник: ${{r.source}}<br>Chat ID: ${{r.chat_id}}<br>Активность: ${{r.last_seen}}</div><div class="badges"><span class="badge">${{r.status}}</span><span class="badge">${{r.source}}</span><span class="badge ${{r.is_free?'free':''}}">${{r.is_free?'бесплатный':r.plan}}</span><span class="badge">${{r.devices_count}}/${{r.devices_limit}} устр.</span><span class="badge">${{r.profile_label}}</span>${{r.pending_plan?`<span class="badge warn">смена: ${{r.pending_plan}}</span>`:''}}</div><div class="actions"><button class="primary" onclick="openClient(${{r.id}})">Открыть</button>${{p?`<button class="blue" onclick="action('approve',${{r.id}})">Одобрить</button><button class="red" onclick="action('reject',${{r.id}})">Отклонить</button>`:`<button onclick="quickStats(${{r.id}})">Статистика</button>`}}</div></article>`}}
 async function openClient(id){{try{{let d=await api('/admin/api/client?id='+id);selected=d.client;renderDetail(selected)}}catch(e){{toast(e.message)}}}}
-function renderDetail(r){{let plans=APP_CONFIG.plans.map(p=>`<option value="${{p.id}}" ${{p.id===r.plan_id?'selected':''}}>${{p.label}}</option>`).join(''),profiles=APP_CONFIG.profiles.map(p=>`<option value="${{p.id}}" ${{p.id===r.profile_type?'selected':''}}>${{p.label}}</option>`).join('');document.getElementById('view').innerHTML=`<button onclick="selected=null;renderCards()">← Назад</button><div class="detail" style="margin-top:14px"><section class="box"><h2>Клиент #${{r.id}} · ${{r.username}}</h2><p class="meta">${{r.full_name}}<br>Источник: ${{r.source}}<br>Chat ID: ${{r.chat_id}}<br>Статус: ${{r.status}}<br>Подписка: ${{r.subscription}}<br>Тариф: ${{r.plan}}<br>Оператор: ${{r.profile_label}}<br>Активность: ${{r.last_seen}}</p><h3>Устройства</h3>${{r.devices.map(d=>`<div class="device"><b>${{d.name}}</b><br>${{d.profile_label}}<br>Email: ${{d.email}}<br>Активность: ${{d.last_seen}}</div>`).join('')||'Нет устройств'}}</section><section class="box"><h3>Действия</h3><div class="actions"><button onclick="action('extend',${{r.id}},{{days:7}})">+7 дней</button><button onclick="action('extend',${{r.id}},{{days:30}})">+30 дней</button><button onclick="action('extend',${{r.id}},{{days:90}})">+90 дней</button><button class="red" onclick="confirmAction('disable',${{r.id}},'Отключить все ссылки клиента?')">Отключить</button></div><div class="box" style="margin-top:12px"><label>Тариф</label><select id="planSelect">${{plans}}</select><button class="primary" style="margin-top:8px;width:100%" onclick="action('set_plan',${{r.id}},{{plan_id:document.getElementById('planSelect').value}})">Сменить тариф</button></div><div class="box" style="margin-top:12px"><label>Оператор / перевыпуск основной ссылки</label><select id="profileSelect">${{profiles}}</select><button class="amber" style="margin-top:8px;width:100%" onclick="confirmAction('reissue',${{r.id}},'Перевыпустить основную ссылку?',{{profile_type:document.getElementById('profileSelect').value}})">Перевыпустить</button></div><div class="actions"><button class="blue" onclick="action('set_free',${{r.id}},{{is_free:${{r.is_free?'false':'true'}}}})">${{r.is_free?'Убрать бесплатный':'Сделать бесплатным'}}</button><button onclick="quickStats(${{r.id}})">Статистика</button><button onclick="action('approve_plan',${{r.id}})">Одобрить смену тарифа</button><button onclick="action('reject_plan',${{r.id}})">Отклонить смену тарифа</button></div><pre id="statsBox"></pre></section></div>`}}
+function renderDetail(r){{let plans=APP_CONFIG.plans.map(p=>`<option value="${{p.id}}" ${{p.id===r.plan_id?'selected':''}}>${{p.label}}</option>`).join(''),profiles=APP_CONFIG.profiles.map(p=>`<option value="${{p.id}}" ${{p.id===r.profile_type?'selected':''}}>${{p.label}}</option>`).join('');document.getElementById('view').innerHTML=`<button onclick="selected=null;renderCards()">← Назад</button><div class="detail" style="margin-top:14px"><section class="box"><h2>Клиент #${{r.id}} · ${{r.username}}</h2><p class="meta">${{r.full_name}}<br>Источник: ${{r.source}}<br>Chat ID: ${{r.chat_id}}<br>Статус: ${{r.status}}<br>Подписка: ${{r.subscription}}<br>Тариф: ${{r.plan}}<br>Оператор: ${{r.profile_label}}<br>Активность: ${{r.last_seen}}</p><h3>Устройства</h3>${{r.devices.map(d=>`<div class="device"><b>${{d.name}}</b><br>${{d.profile_label}}<br>Email: ${{d.email}}<br>Активность: ${{d.last_seen}}</div>`).join('')||'Нет устройств'}}</section><section class="box"><h3>Действия</h3><div class="actions"><button onclick="action('extend',${{r.id}},{{days:7}})">+7 дней</button><button onclick="action('extend',${{r.id}},{{days:30}})">+30 дней</button><button onclick="action('extend',${{r.id}},{{days:90}})">+90 дней</button><button class="red" onclick="confirmAction('disable',${{r.id}},'Отключить все ссылки клиента?')">Отключить</button><button class="red" onclick="confirmAction('delete',${{r.id}},'Удалить клиента из списка и снять его ссылки из Xray?')">Удалить из списка</button></div><div class="box" style="margin-top:12px"><label>Тариф</label><select id="planSelect">${{plans}}</select><button class="primary" style="margin-top:8px;width:100%" onclick="action('set_plan',${{r.id}},{{plan_id:document.getElementById('planSelect').value}})">Сменить тариф</button></div><div class="box" style="margin-top:12px"><label>Оператор / перевыпуск основной ссылки</label><select id="profileSelect">${{profiles}}</select><button class="amber" style="margin-top:8px;width:100%" onclick="confirmAction('reissue',${{r.id}},'Перевыпустить основную ссылку?',{{profile_type:document.getElementById('profileSelect').value}})">Перевыпустить</button></div><div class="actions"><button class="blue" onclick="action('set_free',${{r.id}},{{is_free:${{r.is_free?'false':'true'}}}})">${{r.is_free?'Убрать бесплатный':'Сделать бесплатным'}}</button><button onclick="quickStats(${{r.id}})">Статистика</button><button onclick="action('approve_plan',${{r.id}})">Одобрить смену тарифа</button><button onclick="action('reject_plan',${{r.id}})">Отклонить смену тарифа</button></div><pre id="statsBox"></pre></section></div>`}}
 function confirmAction(n,id,t,e={{}}){{if(confirm(t))action(n,id,e)}}async function action(n,id,e={{}}){{try{{let d=await api('/admin/api/action',{{method:'POST',body:Object.assign({{action:n,id}},e)}});toast(d.message||'Готово');selected=null;await loadClients()}}catch(x){{toast(x.message)}}}}
 async function quickStats(id){{try{{let d=await api('/admin/api/client_stats?id='+id);if(selected)document.getElementById('statsBox').textContent=d.text;else alert(d.text)}}catch(e){{toast(e.message)}}}}
 async function loadServer(show){{try{{let d=await api('/admin/api/server');document.getElementById('serverPill').textContent=`Xray: ${{d.status.xray||'-'}} · CPU ${{d.status.cpu||'-'}}% · RAM ${{d.status.memory||'-'}}`;if(show){{selected=null;document.getElementById('view').innerHTML=`<h2>Ресурсы сервера</h2><div class="box"><pre>${{d.text}}</pre></div>`}}}}catch(e){{toast(e.message)}}}}
@@ -2143,7 +2152,6 @@ def build_public_vpn_html(config: Config) -> str:
                 for key, value in payment_methods(config).items()
             ],
             "defaultPayment": payment_payload(config),
-            "telegramProxyUrl": config.public_telegram_proxy_url,
             "telegramBotUrl": config.public_telegram_bot_url,
         },
         ensure_ascii=False,
@@ -2180,8 +2188,6 @@ def build_public_vpn_html(config: Config) -> str:
 <p class="muted">QR, ссылка оплаты, статус сервера и твоя VPN-ссылка находятся здесь.</p>
 <div id="paymentBox" class="result"></div>
 <div id="botBox" class="result hide"></div>
-<div id="proxyBox" class="result hide"></div>
-<div id="serverAlert" class="result hide"></div>
 <div class="actions"><a id="setupBtn" class="btn hide" href="#">Открыть Happ</a><a id="routingBtn" class="btn secondary hide" href="#">Маршрутизация</a><button id="reissueBtn" class="secondary hide" onclick="reissue()">Перевыпустить ссылку</button></div>
 <div id="linkBox" class="result hide"></div>
 </section>
@@ -2196,13 +2202,12 @@ async function api(path,opts={{}}){{let r=await fetch(path,Object.assign({{heade
 function selectedPayment(){{let id=$('paymentMethod').value;return (CFG.paymentMethods||[]).find(p=>p.id===id)||CFG.defaultPayment||{{}}}}
 function renderPayment(p){{let pay=p?{{label:p.payment_method_label||selectedPayment().label,link:p.payment_link,qr_url:p.payment_qr_url}}:selectedPayment();let plan=$('plan').options[$('plan').selectedIndex]?.text||'';let profile=$('profile').options[$('profile').selectedIndex]?.text||'';$('paymentBox').innerHTML=`<b>Оплата</b><br>Тариф: ${{plan}}<br>Оператор: ${{profile}}<br>Банк: ${{pay.label||'оплата'}}<br>${{pay.link?`<div class="actions"><a class="btn" href="${{pay.link}}" target="_blank">Открыть оплату</a></div>`:''}}${{pay.qr_url?`<img alt="QR оплаты" src="${{pay.qr_url}}" style="margin-top:14px;max-width:260px;width:100%;border-radius:8px;background:#fff;padding:8px">`:'QR появится после настройки PAYMENT_LINK или PAYMENT_QR_URL'}}`;}}
 function renderBot(){{if(!CFG.telegramBotUrl)return;$('botBox').classList.remove('hide');$('botBox').innerHTML=`<b>Telegram-бот</b><br>Через бота можно открыть поддержку и управлять VPN, если Telegram уже доступен.<div class="actions"><a class="btn secondary" href="${{CFG.telegramBotUrl}}" target="_blank">Открыть Telegram-бота</a></div>`}}
-function renderProxy(){{if(!CFG.telegramProxyUrl)return;$('proxyBox').classList.remove('hide');$('proxyBox').innerHTML=`<b>Telegram не открывается?</b><br>Используй запасной бесплатный вход в Telegram, потом вернись сюда и оформи VPN.<div class="actions"><a class="btn secondary" href="${{CFG.telegramProxyUrl}}" target="_blank">Открыть прокси Telegram</a></div>`}}
 function showProfile(p){{localStorage.setItem(tokenKey,p.web_token||localStorage.getItem(tokenKey)||'');renderPayment(p);$('setupBtn').href=p.happ_setup_url||'#';$('routingBtn').href=p.routing_url||'#';$('linkBox').classList.remove('hide');if(p.status==='approved'&&p.vpn_link){{$('setupBtn').classList.remove('hide');$('routingBtn').classList.remove('hide');$('reissueBtn').classList.remove('hide');$('linkBox').innerHTML=`<pre>Профиль #${{p.id}}\\n${{p.profile_label}}\\nПодписка до: ${{p.subscription_until||'-'}}\\n\\n${{p.vpn_link}}</pre>`;return}}$('setupBtn').classList.add('hide');$('routingBtn').classList.add('hide');$('reissueBtn').classList.add('hide');let paid=p.payment_status==='user_marked_paid'?'\\n\\nСтатус оплаты: отмечено как оплачено, ждём проверку администратора.':'\\n\\nПосле оплаты нажми кнопку ниже.';if(p.status==='approved'){{$('linkBox').textContent='Старая VPN-ссылка больше не активна. Если подписка закончилась или профиль отключён, обратись к администратору.';return}}$('linkBox').innerHTML=`<pre>${{p.payment_text||''}}${{paid}}</pre><div class="actions"><button class="secondary" onclick="markPaid()">Я оплатил</button></div>`;}}
 async function issue(){{$('issueBtn').disabled=true;$('issueResult').classList.remove('hide');$('issueResult').textContent='Создаю заявку...';try{{let d=await api('/api/public/issue',{{method:'POST',body:JSON.stringify({{name:$('name').value,contact:$('contact').value,plan_id:$('plan').value,profile_type:$('profile').value,payment_method:$('paymentMethod').value,access_token:$('accessToken').value,web_token:localStorage.getItem(tokenKey)||''}})}});localStorage.setItem(tokenKey,d.web_token);$('issueResult').textContent=d.created?'Заявка создана. Оплати и дождись проверки.':'У тебя уже есть активная или ожидающая заявка.';showProfile(d.profile)}}catch(e){{$('issueResult').textContent=e.message}}finally{{$('issueBtn').disabled=false}}}}
 async function markPaid(){{let t=localStorage.getItem(tokenKey)||'';if(!t)return;try{{let d=await api('/api/public/paid',{{method:'POST',body:JSON.stringify({{web_token:t}})}});showProfile(d.profile)}}catch(e){{$('linkBox').textContent=e.message}}}}
 async function reissue(){{let t=localStorage.getItem(tokenKey)||'';if(!t)return;try{{let d=await api('/api/public/reissue',{{method:'POST',body:JSON.stringify({{web_token:t}})}});showProfile(d.profile)}}catch(e){{$('linkBox').textContent=e.message}}}}
-async function loadMine(){{renderPayment();renderBot();renderProxy();let t=localStorage.getItem(tokenKey)||'';if(!t){{$('linkBox').classList.remove('hide');$('linkBox').textContent='В этом браузере еще нет выпущенной ссылки.';return}}try{{let d=await api('/api/public/me?token='+encodeURIComponent(t));showProfile(d.profile)}}catch(e){{localStorage.removeItem(tokenKey);$('linkBox').classList.remove('hide');$('linkBox').textContent='Старая ссылка убрана с сайта: профиль не найден или больше не активен.'}}}}
-async function loadStatus(){{try{{let d=await api('/api/public/server');$('serverStatus').textContent=d.summary;if(String(d.summary).toLowerCase().includes('не')){{$('serverAlert').classList.remove('hide');$('serverAlert').textContent='Внимание: сервер может быть недоступен. Если VPN не подключается, дождись восстановления или напиши администратору.'}}}}catch(e){{$('serverStatus').textContent='Сервер недоступен';$('serverAlert').classList.remove('hide');$('serverAlert').textContent='Внимание: сервер недоступен. Заявку можно оставить, но подключение может заработать после восстановления.'}}}}
+async function loadMine(){{renderPayment();renderBot();let t=localStorage.getItem(tokenKey)||'';if(!t){{$('linkBox').classList.remove('hide');$('linkBox').textContent='В этом браузере еще нет выпущенной ссылки.';return}}try{{let d=await api('/api/public/me?token='+encodeURIComponent(t));showProfile(d.profile)}}catch(e){{localStorage.removeItem(tokenKey);$('linkBox').classList.remove('hide');$('linkBox').textContent='Старая ссылка убрана с сайта: профиль не найден или больше не активен.'}}}}
+async function loadStatus(){{try{{let d=await api('/api/public/server');$('serverStatus').textContent=d.summary}}catch(e){{$('serverStatus').textContent='Статус сервера временно недоступен'}}}}
 fill();$('paymentMethod').addEventListener('change',()=>renderPayment());$('plan').addEventListener('change',()=>renderPayment());$('profile').addEventListener('change',()=>renderPayment());window.addEventListener('focus',loadMine);loadMine();loadStatus();setInterval(loadMine,15000);
 </script>
 </body>
@@ -2656,6 +2661,27 @@ def start_routing_web_server(config: Config, store: Store | None = None, manager
                         self._send_json(404, {"ok": False, "error": "Профиль не найден."})
                         return
                     self._send_json(200, {"ok": True, "message": f"Бесплатный доступ профиля #{request_id}: {'включён' if updated.get('is_free') else 'выключен'}."})
+                    return
+                if action == "delete":
+                    removed_count = 0
+                    errors = []
+                    for client_email in request_device_emails(row):
+                        try:
+                            manager.remove_client(client_email)
+                            removed_count += 1
+                        except Exception as exc:
+                            errors.append(f"{client_email}: {exc}")
+                            logging.info("Could not remove client %s before deleting request #%s: %s", client_email, request_id, exc)
+                    deleted = store.delete_request(request_id)
+                    if not deleted:
+                        self._send_json(404, {"ok": False, "error": "Профиль не найден."})
+                        return
+                    message = f"Профиль #{request_id} удалён из списка."
+                    if removed_count:
+                        message += f" Ссылок снято из Xray: {removed_count}."
+                    if errors:
+                        message += " Часть ссылок уже не была найдена в Xray."
+                    self._send_json(200, {"ok": True, "message": message})
                     return
                 if action == "disable":
                     if row.get("status") != "approved":
@@ -3159,11 +3185,6 @@ systemctl is-active xray-profile-guard
             for key, command in commands.items():
                 _, out, err = self._run(client, command)
                 result[key] = (out or err).strip()
-            try:
-                verify_public_vpn_endpoint(self, self.config, "default")
-                result["endpoint"] = "ok"
-            except Exception as exc:
-                result["endpoint"] = f"Публичный VPN endpoint не отвечает: {exc}"
             return result
         finally:
             client.close()
@@ -3445,6 +3466,7 @@ def admin_client_access_markup(row: dict[str, Any]) -> str:
     else:
         rows.append([{"text": "Сделать бесплатным", "callback_data": f"free:on:{request_id}"}])
     rows.append([{"text": "Отключить пользователя", "callback_data": f"disable:{request_id}"}])
+    rows.append([{"text": "Удалить из списка", "callback_data": f"delete:{request_id}"}])
     rows.append([{"text": "Назад к клиенту", "callback_data": f"client:{request_id}"}])
     return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
 
@@ -3844,20 +3866,6 @@ def ports_ru(value: Any) -> str:
     if not ports:
         return "- открытых VPN-портов не найдено"
     return "\n".join(f"- порт {port}: открыт" for port in sorted(ports, key=int))
-
-
-def server_health_problem(status: dict[str, Any], config: Config) -> str:
-    xray = str(status.get("xray") or "").strip().lower()
-    if xray != "active":
-        return f"Xray не active: {xray or '-'}"
-    ports = str(status.get("ports") or "")
-    expected_ports = {str(profile_port(config, key)) for key in OPERATOR_PROFILES}
-    if not any(f":{port}" in ports for port in expected_ports):
-        return "Xray active, но VPN-порты не слушаются"
-    endpoint = str(status.get("endpoint") or "").strip()
-    if endpoint and endpoint != "ok":
-        return endpoint
-    return ""
 
 
 def format_vpn_status(status: dict[str, Any], config: Config) -> str:
@@ -4908,6 +4916,30 @@ def handle_callback(
         bot.send_message(user_chat_id, f"Профиль #{request_id} отключён. Его старая VPN-ссылка больше не работает.")
         return
 
+    if parts[0] == "delete" and len(parts) == 2 and parts[1].isdigit():
+        request_id = int(parts[1])
+        row = store.get_request(request_id)
+        if not row:
+            bot.answer_callback_query(callback_id, "Профиль не найден.")
+            return
+        client_emails = request_device_emails(row)
+        bot.safe_answer_callback_query(callback_id, "Удаляю профиль из списка...")
+        removed_count = 0
+        for client_email in client_emails:
+            try:
+                manager.remove_client(client_email)
+                removed_count += 1
+            except Exception as exc:
+                logging.info("Could not remove client %s before deleting request #%s: %s", client_email, request_id, exc)
+        store.delete_request(request_id)
+        message = f"Профиль #{request_id} удалён из списка."
+        if removed_count:
+            message += f" Ссылок снято из Xray: {removed_count}."
+        elif client_emails:
+            message += " Его ссылки уже не были найдены в Xray."
+        bot.send_message(user_chat_id, message)
+        return
+
     if parts[0] == "extend" and len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
         days = int(parts[1])
         request_id = int(parts[2])
@@ -5147,47 +5179,6 @@ def check_inactive_clients(bot: TelegramBot, store: Store, config: Config, manag
         store._write(data)
 
 
-def check_server_health(bot: TelegramBot, store: Store, config: Config, manager: XrayManager) -> None:
-    try:
-        status = manager.check_server_status()
-        problem = server_health_problem(status, config)
-    except Exception as exc:
-        logging.exception("Server health check failed")
-        status = {}
-        problem = f"Не удалось проверить сервер: {exc}"
-
-    data = store._read()
-    monitor = data.setdefault("server_monitor", {})
-    was_down = bool(monitor.get("down"))
-    previous_problem = str(monitor.get("problem") or "")
-    if problem:
-        monitor["down"] = True
-        monitor["problem"] = problem
-        monitor["checked_at"] = utc_now_iso()
-        store._write(data)
-        if was_down and previous_problem == problem:
-            return
-        proxy = config.public_telegram_proxy_url or "PUBLIC_TELEGRAM_PROXY_URL не настроен"
-        text = (
-            "⚠️ VPN-сервер может не работать\n\n"
-            f"Проблема: {problem}\n"
-            f"Xray: {service_status_ru(status.get('xray'))}\n"
-            f"Порты:\n{ports_ru(status.get('ports'))}\n\n"
-            f"Запасной Telegram proxy для клиентов:\n{proxy}"
-        )
-        for admin_chat_id in config.admin_chat_ids:
-            bot.send_message(admin_chat_id, text)
-        return
-
-    monitor["down"] = False
-    monitor["problem"] = ""
-    monitor["checked_at"] = utc_now_iso()
-    store._write(data)
-    if was_down:
-        for admin_chat_id in config.admin_chat_ids:
-            bot.send_message(admin_chat_id, "✅ VPN-сервер снова отвечает. Xray active, порты и endpoint проверены.")
-
-
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     config = load_config()
@@ -5229,7 +5220,6 @@ def main() -> None:
     last_sharing_check = 0.0
     last_subscription_check = 0.0
     last_inactive_check = 0.0
-    last_server_health_check = 0.0
     while True:
         try:
             now = time.monotonic()
@@ -5253,13 +5243,6 @@ def main() -> None:
                 except Exception:
                     logging.exception("Sharing alert check failed")
                 last_sharing_check = now
-
-            if now - last_server_health_check >= SERVER_HEALTH_CHECK_INTERVAL_SECONDS:
-                try:
-                    check_server_health(bot, store, config, manager)
-                except Exception:
-                    logging.exception("Server health check failed")
-                last_server_health_check = now
 
             updates = bot.get_updates(offset=offset)
             for update in updates:
