@@ -486,6 +486,13 @@ def normalize_public_contact(value: str) -> str:
     return normalized
 
 
+def chat_id_from_contact(value: str) -> int:
+    digits = re.sub(r"\D+", "", value.strip())
+    if len(digits) >= 6:
+        return int(digits)
+    return 0
+
+
 def web_client_email(request_id: int) -> str:
     return f"web-{request_id}-{uuid.uuid4().hex[:8]}"
 
@@ -1087,12 +1094,14 @@ class Store:
         contact: str,
         profile_type: str,
         plan_id: str,
+        payment_method: str,
         web_token: str,
     ) -> tuple[dict[str, Any], bool]:
         now = utc_now_iso()
         plan = plan_info(plan_id)
         normalized_contact = normalize_public_contact(contact)
         data = self._read()
+        known_chat_id = self._chat_id_for_contact(data, contact, normalized_contact)
         for request in reversed(data["requests"]):
             if request.get("status") not in {"pending", "approved"}:
                 continue
@@ -1105,6 +1114,7 @@ class Store:
                 request["plan_id"] = str(plan_id)
                 request["plan_devices"] = plan["devices"]
                 request["plan_price"] = plan["price"]
+                request["payment_method"] = payment_method
                 request["full_name"] = display_name or request.get("full_name") or "Web user"
                 request["username"] = contact or request.get("username") or "web-user"
                 request["contact_key"] = normalized_contact
@@ -1116,7 +1126,7 @@ class Store:
         data["last_id"] = request_id
         row = {
             "id": request_id,
-            "chat_id": -request_id,
+            "chat_id": known_chat_id or -request_id,
             "username": contact or "web-user",
             "full_name": display_name or contact or "Web user",
             "status": "pending",
@@ -1127,6 +1137,8 @@ class Store:
             "plan_id": str(plan_id),
             "plan_devices": plan["devices"],
             "plan_price": plan["price"],
+            "payment_method": payment_method,
+            "payment_status": "waiting_manual_payment",
             "client_email": "",
             "uuid": "",
             "devices": [],
@@ -1136,6 +1148,37 @@ class Store:
         data["requests"].append(row)
         self._write(data)
         return row, True
+
+    @staticmethod
+    def _chat_id_for_contact(data: dict[str, Any], contact: str, normalized_contact: str) -> int:
+        direct_chat_id = chat_id_from_contact(contact)
+        if direct_chat_id:
+            return direct_chat_id
+        if not normalized_contact:
+            return 0
+        for request in reversed(data.get("requests", [])):
+            chat_id = int(request.get("chat_id") or 0)
+            if chat_id <= 0:
+                continue
+            username = normalize_public_contact(str(request.get("username") or ""))
+            contact_key = normalize_public_contact(str(request.get("contact_key") or ""))
+            if normalized_contact in {username, contact_key}:
+                return chat_id
+        return 0
+
+    def mark_web_paid(self, web_token: str) -> dict[str, Any] | None:
+        if not web_token:
+            return None
+        data = self._read()
+        for request in reversed(data["requests"]):
+            if str(request.get("web_token") or "") != web_token:
+                continue
+            if request.get("status") == "pending":
+                request["payment_status"] = "user_marked_paid"
+                request["paid_marked_at"] = utc_now_iso()
+                self._write(data)
+            return request
+        return None
 
     def get_request_by_web_token(self, web_token: str) -> dict[str, Any] | None:
         if not web_token:
@@ -1955,7 +1998,10 @@ def public_profile_payload(row: dict[str, Any], config: Config) -> dict[str, Any
     client_uuid = str(row.get("uuid") or "")
     link = build_vless_link(config, client_uuid, profile_type, label) if client_uuid else ""
     request_id = int(row.get("id") or 0)
-    payment_method = "sber"
+    payment_method = str(row.get("payment_method") or "sber")
+    if payment_method not in payment_methods(config):
+        payment_method = "sber"
+    methods = payment_methods(config)
     return {
         "id": request_id,
         "status": str(row.get("status") or ""),
@@ -1968,9 +2014,14 @@ def public_profile_payload(row: dict[str, Any], config: Config) -> dict[str, Any
         "routing_url": happ_routing_redirect_url(config) or build_happ_routing_link(),
         "claim_code": str(row.get("web_token") or ""),
         "web_token": str(row.get("web_token") or ""),
+        "payment_status": str(row.get("payment_status") or ""),
         "payment_text": payment_text(config, request_id, row.get("plan_id"), profile_type, payment_method),
         "payment_qr_url": payment_qr_source(config, payment_method),
         "payment_link": payment_method_info(config, payment_method).get("link") or "",
+        "payment_methods": [
+            {"id": key, "label": value["label"], "link": value.get("link") or ""}
+            for key, value in methods.items()
+        ],
     }
 
 
@@ -1987,6 +2038,10 @@ def build_public_vpn_html(config: Config) -> str:
             ],
             "requiresToken": bool(config.public_issue_token),
             "enabled": config.public_issue_enabled,
+            "paymentMethods": [
+                {"id": key, "label": value["label"]}
+                for key, value in payment_methods(config).items()
+            ],
         },
         ensure_ascii=False,
     )
@@ -2011,6 +2066,7 @@ def build_public_vpn_html(config: Config) -> str:
 <label>Контакт</label><input id="contact" placeholder="@username, телефон или почта">
 <label>Тариф</label><select id="plan"></select>
 <label>Оператор</label><select id="profile"></select>
+<label>Оплата</label><select id="paymentMethod"></select>
 <div id="tokenBox" class="hide"><label>Код доступа</label><input id="accessToken" placeholder="Код от администратора"></div>
 <div class="actions"><button id="issueBtn" onclick="issue()">Создать заявку</button><button class="secondary" onclick="loadMine()">Проверить заявку</button></div>
 <div id="issueResult" class="result hide"></div>
@@ -2027,10 +2083,11 @@ def build_public_vpn_html(config: Config) -> str:
 const CFG={public_config};
 const tokenKey='vpnWebToken';
 function $(id){{return document.getElementById(id)}}
-function fill(){{CFG.plans.forEach(p=>$('plan').add(new Option(p.label,p.id)));CFG.profiles.forEach(p=>$('profile').add(new Option(p.label,p.id)));if(CFG.requiresToken)$('tokenBox').classList.remove('hide');if(!CFG.enabled){{$('issueBtn').disabled=true;$('issueResult').classList.remove('hide');$('issueResult').textContent='Выпуск ссылок на сайте пока выключен.'}}}}
+function fill(){{CFG.plans.forEach(p=>$('plan').add(new Option(p.label,p.id)));CFG.profiles.forEach(p=>$('profile').add(new Option(p.label,p.id)));(CFG.paymentMethods||[]).forEach(p=>$('paymentMethod').add(new Option(p.label,p.id)));if(!($('paymentMethod').options.length))$('paymentMethod').add(new Option('Оплата администратору','sber'));if(CFG.requiresToken)$('tokenBox').classList.remove('hide');if(!CFG.enabled){{$('issueBtn').disabled=true;$('issueResult').classList.remove('hide');$('issueResult').textContent='Выпуск ссылок на сайте пока выключен.'}}}}
 async function api(path,opts={{}}){{let r=await fetch(path,Object.assign({{headers:{{'Content-Type':'application/json'}}}},opts));let d=await r.json();if(!r.ok||!d.ok)throw new Error(d.error||'Ошибка');return d}}
-function showProfile(p){{localStorage.setItem(tokenKey,p.web_token||localStorage.getItem(tokenKey)||'');$('setupBtn').href=p.happ_setup_url||'#';$('routingBtn').href=p.routing_url||'#';$('linkBox').classList.remove('hide');if(p.status==='approved'&&p.vpn_link){{$('setupBtn').classList.remove('hide');$('routingBtn').classList.remove('hide');$('linkBox').textContent=`Профиль #${{p.id}}\\n${{p.profile_label}}\\nПодписка до: ${{p.subscription_until||'-'}}\\nКод привязки к Telegram: /claim ${{p.claim_code||localStorage.getItem(tokenKey)||''}}\\n\\n${{p.vpn_link}}`;return}}$('setupBtn').classList.add('hide');$('routingBtn').classList.add('hide');$('linkBox').textContent=`Заявка #${{p.id}} ожидает оплаты и проверки.\\n${{p.profile_label}}\\n${{p.plan}}\\n\\n${{p.payment_text||''}}`;}}
-async function issue(){{$('issueBtn').disabled=true;$('issueResult').classList.remove('hide');$('issueResult').textContent='Создаю заявку...';try{{let d=await api('/api/public/issue',{{method:'POST',body:JSON.stringify({{name:$('name').value,contact:$('contact').value,plan_id:$('plan').value,profile_type:$('profile').value,access_token:$('accessToken').value,web_token:localStorage.getItem(tokenKey)||''}})}});localStorage.setItem(tokenKey,d.web_token);$('issueResult').textContent=d.created?'Заявка создана. Оплати и дождись проверки.':'У тебя уже есть активная или ожидающая заявка.';showProfile(d.profile)}}catch(e){{$('issueResult').textContent=e.message}}finally{{$('issueBtn').disabled=false}}}}
+function showProfile(p){{localStorage.setItem(tokenKey,p.web_token||localStorage.getItem(tokenKey)||'');$('setupBtn').href=p.happ_setup_url||'#';$('routingBtn').href=p.routing_url||'#';$('linkBox').classList.remove('hide');if(p.status==='approved'&&p.vpn_link){{$('setupBtn').classList.remove('hide');$('routingBtn').classList.remove('hide');$('linkBox').textContent=`Профиль #${{p.id}}\\n${{p.profile_label}}\\nПодписка до: ${{p.subscription_until||'-'}}\\nКод привязки к Telegram: /claim ${{p.claim_code||localStorage.getItem(tokenKey)||''}}\\n\\n${{p.vpn_link}}`;return}}$('setupBtn').classList.add('hide');$('routingBtn').classList.add('hide');let paid=p.payment_status==='user_marked_paid'?'\\n\\nСтатус оплаты: отмечено как оплачено, ждём проверку администратора.':'\\n\\nПосле оплаты нажми кнопку ниже.';$('linkBox').innerHTML=`<pre>${{p.payment_text||''}}${{paid}}\\n\\nДля привязки Telegram: /claim ${{p.claim_code||localStorage.getItem(tokenKey)||''}}</pre>${{p.payment_link?`<div class="actions"><a class="btn" href="${{p.payment_link}}" target="_blank">Открыть оплату</a><button class="secondary" onclick="markPaid()">Я оплатил</button></div>`:`<div class="actions"><button class="secondary" onclick="markPaid()">Я оплатил</button></div>`}}${{p.payment_qr_url?`<img alt="QR оплаты" src="${{p.payment_qr_url}}" style="margin-top:14px;max-width:260px;width:100%;border-radius:8px;background:#fff;padding:8px">`:''}}`;}}
+async function issue(){{$('issueBtn').disabled=true;$('issueResult').classList.remove('hide');$('issueResult').textContent='Создаю заявку...';try{{let d=await api('/api/public/issue',{{method:'POST',body:JSON.stringify({{name:$('name').value,contact:$('contact').value,plan_id:$('plan').value,profile_type:$('profile').value,payment_method:$('paymentMethod').value,access_token:$('accessToken').value,web_token:localStorage.getItem(tokenKey)||''}})}});localStorage.setItem(tokenKey,d.web_token);$('issueResult').textContent=d.created?'Заявка создана. Оплати и дождись проверки.':'У тебя уже есть активная или ожидающая заявка.';showProfile(d.profile)}}catch(e){{$('issueResult').textContent=e.message}}finally{{$('issueBtn').disabled=false}}}}
+async function markPaid(){{let t=localStorage.getItem(tokenKey)||'';if(!t)return;try{{let d=await api('/api/public/paid',{{method:'POST',body:JSON.stringify({{web_token:t}})}});showProfile(d.profile)}}catch(e){{$('linkBox').textContent=e.message}}}}
 async function loadMine(){{let t=localStorage.getItem(tokenKey)||'';if(!t){{$('linkBox').classList.remove('hide');$('linkBox').textContent='В этом браузере еще нет выпущенной ссылки.';return}}try{{let d=await api('/api/public/me?token='+encodeURIComponent(t));showProfile(d.profile)}}catch(e){{$('linkBox').classList.remove('hide');$('linkBox').textContent=e.message}}}}
 async function loadStatus(){{try{{let d=await api('/api/public/server');$('serverStatus').textContent=d.summary}}catch(e){{$('serverStatus').textContent='Сервер недоступен'}}}}
 fill();loadMine();loadStatus();
@@ -2181,6 +2238,30 @@ def start_routing_web_server(config: Config, store: Store | None = None, manager
                 self._send_json(500, {"ok": False, "error": str(exc)})
 
         def _handle_public_post(self, path: str) -> None:
+            if path == "/api/public/paid":
+                if not store:
+                    self._send_json(503, {"ok": False, "error": "Сайт еще запускается."})
+                    return
+                payload = self._read_json()
+                row = store.mark_web_paid(str(payload.get("web_token") or "").strip())
+                if not row:
+                    self._send_json(404, {"ok": False, "error": "Заявка не найдена."})
+                    return
+                if bot:
+                    text = (
+                        f"Пользователь отметил оплату заявки #{row['id']}.\n"
+                        f"Контакт: {row.get('username') or '-'}\n"
+                        f"Сумма: {plan_info(row.get('plan_id'))['price']} руб\n"
+                        f"Комментарий: {payment_comment(int(row['id']))}"
+                    )
+                    for admin_chat_id in config.admin_chat_ids:
+                        try:
+                            bot.send_message(admin_chat_id, text, admin_request_markup(int(row["id"])))
+                        except Exception:
+                            logging.exception("Could not notify admin about web payment")
+                    send_row_message(bot, row, f"Оплата по заявке #{row['id']} отмечена. Админ проверит платеж и включит VPN.")
+                self._send_json(200, {"ok": True, "profile": public_profile_payload(row, config)})
+                return
             if path != "/api/public/issue":
                 self._send_json(404, {"ok": False, "error": "Не найдено."})
                 return
@@ -2201,6 +2282,9 @@ def start_routing_web_server(config: Config, store: Store | None = None, manager
                 plan_id = str(payload.get("plan_id") or "1")
                 if plan_id not in SUBSCRIPTION_PLANS:
                     plan_id = "1"
+                payment_method = str(payload.get("payment_method") or "sber")
+                if payment_method not in payment_methods(config):
+                    payment_method = next(iter(payment_methods(config)), "sber")
                 display_name = str(payload.get("name") or "").strip()[:80]
                 contact = str(payload.get("contact") or "").strip()[:80]
                 if not contact:
@@ -2214,6 +2298,7 @@ def start_routing_web_server(config: Config, store: Store | None = None, manager
                     contact,
                     profile_type,
                     plan_id,
+                    payment_method,
                     web_token,
                 )
                 if bot:
@@ -2223,6 +2308,8 @@ def start_routing_web_server(config: Config, store: Store | None = None, manager
                         f"Имя: {display_name or '-'}\n"
                         f"Оператор: {profile_label(profile_type)}\n"
                         f"Тариф: {plan_label(plan_id)}\n"
+                        f"Оплата: {payment_method_info(config, payment_method)['label']}\n"
+                        f"Комментарий: {payment_comment(int(row['id']))}\n"
                         f"Статус: ожидает оплаты/проверки"
                     )
                     for admin_chat_id in config.admin_chat_ids:
@@ -2230,6 +2317,11 @@ def start_routing_web_server(config: Config, store: Store | None = None, manager
                             bot.send_message(admin_chat_id, text, admin_request_markup(int(row["id"])))
                         except Exception:
                             logging.exception("Could not notify admin about public web request")
+                    send_row_message(
+                        bot,
+                        row,
+                        f"Заявка #{row['id']} создана. Оплати {plan_info(plan_id)['price']} руб, комментарий: {payment_comment(int(row['id']))}. После оплаты нажми «Я оплатил» на сайте.",
+                    )
                 self._send_json(200, {"ok": True, "created": created, "web_token": web_token, "profile": public_profile_payload(row, config)})
             except Exception as exc:
                 logging.exception("Public web issue failed")
